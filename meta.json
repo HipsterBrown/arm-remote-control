@@ -1,0 +1,30 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "hipsterbrown:arm-remote-control",
+  "visibility": "public",
+  "url": "",
+  "description": "Modular generic service: gamepad",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "hipsterbrown:arm-remote-control:gamepad",
+      "short_description": "Provide a short (100 characters or less) description of this model here",
+      "markdown_link": "README.md#model-hipsterbrownarm-remote-controlgamepad"
+    }
+  ],
+  "applications": null,
+  "markdown_link": "README.md",
+  "entrypoint": "bin/arm-remote-control",
+  "first_run": "",
+  "build": {
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "module.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "darwin/arm64",
+      "windows/amd64"
+    ]
+  }
+}

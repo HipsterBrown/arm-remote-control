@@ -1,0 +1,13 @@
+{
+  "module_name": "arm-remote-control",
+  "namespace": "hipsterbrown",
+  "language": "go",
+  "resource_type": "service",
+  "resource_subtype": "generic",
+  "model_name": "gamepad",
+  "enable_cloud_build": true,
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2025-07-10T19:41:35.695468Z",
+  "module_readme_link": "README.md"
+}
