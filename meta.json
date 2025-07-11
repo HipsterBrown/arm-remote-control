@@ -2,13 +2,13 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "hipsterbrown:arm-remote-control",
   "visibility": "public",
-  "url": "",
-  "description": "Modular generic service: gamepad",
+  "url": "https://github.com/hipsterbrown/arm-remote-control",
+  "description": "A service for teleoperating an arm with an input controller",
   "models": [
     {
       "api": "rdk:service:generic",
       "model": "hipsterbrown:arm-remote-control:gamepad",
-      "short_description": "Provide a short (100 characters or less) description of this model here",
+      "short_description": "teleoperating an arm with an input controller",
       "markdown_link": "README.md#model-hipsterbrownarm-remote-controlgamepad"
     }
   ],
