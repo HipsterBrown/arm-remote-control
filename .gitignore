@@ -28,3 +28,4 @@ go.work.sum
 # Build outputs
 bin
 *tar.gz
+.DS_Store

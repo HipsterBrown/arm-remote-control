@@ -213,8 +213,13 @@ func (arc *armRemoteControlGamepad) continuousMovementProcessor() {
 
 			// Apply continuous movement
 			arc.mu.Lock()
-			point := arc.targetPose.Point()
-			orientation := arc.targetPose.Orientation()
+			currentPose, err := arc.arm.EndPosition(arc.cancelCtx, nil)
+			if err != nil {
+				arc.logger.Debug("Unable to get current end position")
+				continue
+			}
+			point := currentPose.Point()
+			orientation := currentPose.Orientation()
 
 			// Z-axis movement from buttons
 			if rtPressed {
@@ -235,7 +240,7 @@ func (arc *armRemoteControlGamepad) continuousMovementProcessor() {
 
 			// Y-axis movement from hat
 			if hat0Y != 0.0 {
-				deltaY := -hat0Y * arc.stepSize // Invert Y for intuitive forward/back
+				deltaY := hat0Y * arc.stepSize
 				point.Y += deltaY
 				arc.logger.Debugf("Hat0Y held: %f -> Delta Y: %f, New Y: %f", hat0Y, deltaY, point.Y)
 			}
@@ -361,7 +366,7 @@ func (arc *armRemoteControlGamepad) registerCallbacks(ctx context.Context) error
 	return nil
 }
 
-func (arc *armRemoteControlGamepad) processMovementEvent(ctx context.Context, event input.Event) {
+func (arc *armRemoteControlGamepad) processMovementEvent(_ context.Context, event input.Event) {
 	arc.mu.Lock()
 	defer arc.mu.Unlock()
 
