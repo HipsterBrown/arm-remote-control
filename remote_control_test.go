@@ -236,6 +236,41 @@ func TestTeleopModeIssuesStartOnceWithComponentNameAndReferenceFrame(t *testing.
 	}
 }
 
+// A 5-DoF arm cannot hold its tool orientation through a sideways move, so
+// the teleop goal must be position-only or X/Y deltas yield zero IK solutions.
+func TestTeleopStartRequestsPositionOnlyGoal(t *testing.T) {
+	fa := &fakeArm{}
+	fms := &fakeMotionService{handler: healthyStatusHandler()}
+	logger := newTestLogger(t)
+	ctx := context.Background()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	deps := resource.Dependencies{motion.Named("motion-1"): fms}
+	conf := &Config{ArmName: "arm-1", MotionServiceName: "motion-1", ReferenceFrame: "gripper-1"}
+
+	if _, err := newMover(ctx, deps, conf, fa, logger, cancelCtx, &wg); err != nil {
+		t.Fatalf("newMover: %v", err)
+	}
+	cancel()
+
+	startCalls := fms.callsFor(motionbuiltin.DoTeleopStart)
+	if len(startCalls) != 1 {
+		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(startCalls))
+	}
+	payload, ok := startCalls[0][motionbuiltin.DoTeleopStart].(string)
+	if !ok {
+		t.Fatalf("teleop_start value is not a string: %#v", startCalls[0][motionbuiltin.DoTeleopStart])
+	}
+
+	req := unaryMoveRequest(t, payload)
+	if got := req.GetExtra().AsMap()["goal_metric_type"]; got != "position_only" {
+		t.Fatalf("goal_metric_type = %v, want \"position_only\"", got)
+	}
+}
+
 func TestStepEmitsTeleopMoveWithDeltaAndTopLevelComponentName(t *testing.T) {
 	fa := &fakeArm{}
 	fms := &fakeMotionService{handler: healthyStatusHandler()}

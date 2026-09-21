@@ -10,6 +10,7 @@ import (
 	motionpb "go.viam.com/api/service/motion/v1"
 	"go.viam.com/utils"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/input"
@@ -200,9 +201,29 @@ func deltaPoseInFrame(frame string, dx, dy, dz float64) *commonpb.PoseInFrame {
 // against go.viam.com/rdk@v1.7.0/services/motion/builtin/teleop.go, not a
 // typo carried over from the spec.
 func (m *teleopMover) start(ctx context.Context) error {
+	// Plan for position only, leaving orientation unconstrained.
+	//
+	// A PoseInFrame always carries an orientation, so an identity-rotation
+	// delta still asks the planner to hold the tool's current orientation
+	// exactly. On an arm with fewer than six degrees of freedom that is
+	// generally unsatisfiable while translating: the RoArm-M3 has no wrist
+	// yaw, so its base joint sets both the tool's azimuth and the working
+	// plane, and any sideways move changes the orientation it was told to
+	// hold. The planner then returns zero IK solutions for X and Y while Z
+	// still succeeds, because motion along the approach axis stays in plane.
+	//
+	// The arm driver already passes this on its own MoveToPosition path,
+	// which is why direct mode works where teleop mode did not.
+	extra, err := structpb.NewStruct(map[string]interface{}{
+		"goal_metric_type": "position_only",
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to build teleop_start extra")
+	}
 	req := &motionpb.MoveRequest{
 		ComponentName: m.componentName,
 		Destination:   deltaPoseInFrame(m.componentName, 0, 0, 0),
+		Extra:         extra,
 	}
 	payload, err := teleopMarshalOpts.Marshal(req)
 	if err != nil {
