@@ -2,19 +2,20 @@ package armremotecontrol
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/golang/geo/r3"
 	commonpb "go.viam.com/api/common/v1"
+	motionpb "go.viam.com/api/service/motion/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/motion"
+	motionbuiltin "go.viam.com/rdk/services/motion/builtin"
 	"go.viam.com/rdk/spatialmath"
 )
 
@@ -104,17 +105,17 @@ func healthyStatusHandler() func(cmd map[string]interface{}) (map[string]interfa
 	var planCount float64
 	var mu sync.Mutex
 	return func(cmd map[string]interface{}) (map[string]interface{}, error) {
-		if _, ok := cmd[doTeleopMove]; ok {
+		if _, ok := cmd[motionbuiltin.DoTeleopMove]; ok {
 			mu.Lock()
 			planCount++
 			mu.Unlock()
 		}
-		if _, ok := cmd[doTeleopStatus]; ok {
+		if _, ok := cmd[motionbuiltin.DoTeleopStatus]; ok {
 			mu.Lock()
 			pc := planCount
 			mu.Unlock()
 			return map[string]interface{}{
-				doTeleopStatus: map[string]interface{}{
+				motionbuiltin.DoTeleopStatus: map[string]interface{}{
 					"running":    true,
 					"plan_count": pc,
 				},
@@ -138,6 +139,18 @@ func unaryPoseInFrame(t *testing.T, raw string) *commonpb.PoseInFrame {
 		t.Fatalf("payload did not parse as protojson PoseInFrame: %v\npayload: %s", err, raw)
 	}
 	return pif
+}
+
+// unaryMoveRequest parses teleop_start's payload using protojson into the
+// real pb.MoveRequest, so a malformed command is caught rather than only
+// string-matched.
+func unaryMoveRequest(t *testing.T, raw string) *motionpb.MoveRequest {
+	t.Helper()
+	req := &motionpb.MoveRequest{}
+	if err := protojson.Unmarshal([]byte(raw), req); err != nil {
+		t.Fatalf("payload did not parse as protojson MoveRequest: %v\npayload: %s", err, raw)
+	}
+	return req
 }
 
 func TestDirectModeSelectedWhenMotionServiceUnset(t *testing.T) {
@@ -201,30 +214,25 @@ func TestTeleopModeIssuesStartOnceWithComponentNameAndReferenceFrame(t *testing.
 		t.Fatalf("expected *teleopMover, got %T", mv)
 	}
 
-	startCalls := fms.callsFor(doTeleopStart)
+	startCalls := fms.callsFor(motionbuiltin.DoTeleopStart)
 	if len(startCalls) != 1 {
 		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(startCalls))
 	}
 
-	payload, ok := startCalls[0][doTeleopStart].(string)
+	payload, ok := startCalls[0][motionbuiltin.DoTeleopStart].(string)
 	if !ok {
-		t.Fatalf("teleop_start value is not a string: %#v", startCalls[0][doTeleopStart])
+		t.Fatalf("teleop_start value is not a string: %#v", startCalls[0][motionbuiltin.DoTeleopStart])
 	}
 
-	var envelope struct {
-		ComponentName string          `json:"component_name"`
-		Destination   json.RawMessage `json:"destination"`
+	// The full envelope, including component_name, now round-trips through
+	// protojson into the real pb.MoveRequest (component_name is a plain
+	// string field as of go.viam.com/api v0.1.579 / rdk v1.7.0).
+	req := unaryMoveRequest(t, payload)
+	if req.GetComponentName() != "gripper-1" {
+		t.Fatalf("expected component_name gripper-1, got %q", req.GetComponentName())
 	}
-	if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
-		t.Fatalf("teleop_start payload is not valid JSON: %v", err)
-	}
-	if envelope.ComponentName != "gripper-1" {
-		t.Fatalf("expected component_name gripper-1, got %q", envelope.ComponentName)
-	}
-
-	pif := unaryPoseInFrame(t, string(envelope.Destination))
-	if pif.GetReferenceFrame() != "gripper-1" {
-		t.Fatalf("expected destination.reference_frame gripper-1, got %q", pif.GetReferenceFrame())
+	if req.GetDestination().GetReferenceFrame() != "gripper-1" {
+		t.Fatalf("expected destination.reference_frame gripper-1, got %q", req.GetDestination().GetReferenceFrame())
 	}
 }
 
@@ -251,7 +259,7 @@ func TestStepEmitsTeleopMoveWithDeltaAndTopLevelComponentName(t *testing.T) {
 		t.Fatalf("step: %v", err)
 	}
 
-	moveCalls := fms.callsFor(doTeleopMove)
+	moveCalls := fms.callsFor(motionbuiltin.DoTeleopMove)
 	// The startup probe itself issues one zero-delta teleop_move; our explicit
 	// step is the last one.
 	if len(moveCalls) < 1 {
@@ -264,9 +272,9 @@ func TestStepEmitsTeleopMoveWithDeltaAndTopLevelComponentName(t *testing.T) {
 		t.Fatalf("expected top-level component_name gripper-1, got %#v", last["component_name"])
 	}
 
-	payload, ok := last[doTeleopMove].(string)
+	payload, ok := last[motionbuiltin.DoTeleopMove].(string)
 	if !ok {
-		t.Fatalf("teleop_move value is not a string: %#v", last[doTeleopMove])
+		t.Fatalf("teleop_move value is not a string: %#v", last[motionbuiltin.DoTeleopMove])
 	}
 	pif := unaryPoseInFrame(t, payload)
 	if pif.GetReferenceFrame() != "gripper-1" {
@@ -306,13 +314,13 @@ func TestStepDeltasAreRelativeNotAccumulating(t *testing.T) {
 		t.Fatalf("step 2: %v", err)
 	}
 
-	moveCalls := fms.callsFor(doTeleopMove)
+	moveCalls := fms.callsFor(motionbuiltin.DoTeleopMove)
 	if len(moveCalls) < 2 {
 		t.Fatalf("expected at least 2 teleop_move calls, got %d", len(moveCalls))
 	}
 	lastTwo := moveCalls[len(moveCalls)-2:]
-	pif1 := unaryPoseInFrame(t, lastTwo[0][doTeleopMove].(string))
-	pif2 := unaryPoseInFrame(t, lastTwo[1][doTeleopMove].(string))
+	pif1 := unaryPoseInFrame(t, lastTwo[0][motionbuiltin.DoTeleopMove].(string))
+	pif2 := unaryPoseInFrame(t, lastTwo[1][motionbuiltin.DoTeleopMove].(string))
 
 	if pif1.GetPose().GetX() != 5 || pif2.GetPose().GetX() != 5 {
 		t.Fatalf("expected both steps to carry delta x=5 (not accumulating), got %v then %v",
@@ -352,9 +360,9 @@ func TestStartupFailsWhenProbeReportsError(t *testing.T) {
 	fa := &fakeArm{}
 	fms := &fakeMotionService{
 		handler: func(cmd map[string]interface{}) (map[string]interface{}, error) {
-			if _, ok := cmd[doTeleopStatus]; ok {
+			if _, ok := cmd[motionbuiltin.DoTeleopStatus]; ok {
 				return map[string]interface{}{
-					doTeleopStatus: map[string]interface{}{
+					motionbuiltin.DoTeleopStatus: map[string]interface{}{
 						"running":    true,
 						"plan_count": float64(0),
 						"error":      "reference frame gripper-9000 does not exist",
@@ -406,9 +414,9 @@ func TestStatusErrorDuringOperationLogsAndDoesNotSwitchModes(t *testing.T) {
 	// Simulate the pipeline reporting an error on every poll.
 	fms.mu.Lock()
 	fms.handler = func(cmd map[string]interface{}) (map[string]interface{}, error) {
-		if _, ok := cmd[doTeleopStatus]; ok {
+		if _, ok := cmd[motionbuiltin.DoTeleopStatus]; ok {
 			return map[string]interface{}{
-				doTeleopStatus: map[string]interface{}{
+				motionbuiltin.DoTeleopStatus: map[string]interface{}{
 					"running": true,
 					"error":   "planner stalled",
 				},
@@ -462,11 +470,44 @@ func TestStopCallsBothTeleopStopAndArmStop(t *testing.T) {
 		t.Fatalf("stop: %v", err)
 	}
 
-	if len(fms.callsFor(doTeleopStop)) != 1 {
-		t.Fatalf("expected exactly 1 teleop_stop call, got %d", len(fms.callsFor(doTeleopStop)))
+	if len(fms.callsFor(motionbuiltin.DoTeleopStop)) != 1 {
+		t.Fatalf("expected exactly 1 teleop_stop call, got %d", len(fms.callsFor(motionbuiltin.DoTeleopStop)))
 	}
 	if fa.getStopCalls() != 1 {
 		t.Fatalf("expected arm.Stop to be called once, got %d", fa.getStopCalls())
+	}
+}
+
+// A misconfigured reference_frame is expected to surface as an error well
+// within the probe timeout (see teleop.go: planTeleopMulti sets lastErr on
+// every failed plan attempt). This covers the residual gap: if the pipeline
+// never advances plan_count and never reports an error either, construction
+// must still succeed (a slow first plan is plausible) but must not pass
+// silently.
+func TestProbeTimesOutWithoutAdvanceOrErrorSucceedsButWarns(t *testing.T) {
+	fa := &fakeArm{}
+	fms := &fakeMotionService{
+		handler: func(cmd map[string]interface{}) (map[string]interface{}, error) {
+			if _, ok := cmd[motionbuiltin.DoTeleopStatus]; ok {
+				return map[string]interface{}{
+					motionbuiltin.DoTeleopStatus: map[string]interface{}{"running": true, "plan_count": float64(0)},
+				}, nil
+			}
+			return map[string]interface{}{}, nil
+		},
+	}
+	logger := newTestLogger(t)
+	ctx := context.Background()
+
+	tm := &teleopMover{motionSvc: fms, arm: fa, componentName: "gripper-1", logger: logger}
+	start := time.Now()
+	err := tm.probe(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("expected probe to succeed (logging a warning, not failing) on a plain timeout, got: %v", err)
+	}
+	if elapsed < teleopProbeTimeout {
+		t.Fatalf("expected probe to wait out the full timeout (%s) before giving up, only waited %s", teleopProbeTimeout, elapsed)
 	}
 }
 
@@ -476,9 +517,9 @@ func TestProbeRespectsContextCancellation(t *testing.T) {
 	fa := &fakeArm{}
 	fms := &fakeMotionService{
 		handler: func(cmd map[string]interface{}) (map[string]interface{}, error) {
-			if _, ok := cmd[doTeleopStatus]; ok {
+			if _, ok := cmd[motionbuiltin.DoTeleopStatus]; ok {
 				return map[string]interface{}{
-					doTeleopStatus: map[string]interface{}{"running": true, "plan_count": float64(0)},
+					motionbuiltin.DoTeleopStatus: map[string]interface{}{"running": true, "plan_count": float64(0)},
 				}, nil
 			}
 			return map[string]interface{}{}, nil

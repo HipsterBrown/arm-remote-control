@@ -1,8 +1,8 @@
 package main
 
 import (
-	"context"
 	"armremotecontrol"
+	"context"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/generic"

@@ -2,12 +2,12 @@ package armremotecontrol
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 	commonpb "go.viam.com/api/common/v1"
+	motionpb "go.viam.com/api/service/motion/v1"
 	"go.viam.com/utils"
 	"google.golang.org/protobuf/encoding/protojson"
 
@@ -17,6 +17,7 @@ import (
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/generic"
 	"go.viam.com/rdk/services/motion"
+	motionbuiltin "go.viam.com/rdk/services/motion/builtin"
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/utils/rpc"
 )
@@ -28,16 +29,6 @@ var (
 
 const (
 	defaultStepSize = 10.0 // mm for all axis movements
-
-	// DoCommand keys understood by the RDK motion service's teleop pipeline
-	// (go.viam.com/rdk/services/motion/builtin, DoTeleop* constants). Declared
-	// locally rather than imported: that package is a server-side
-	// implementation detail, and this module only needs to speak its wire
-	// protocol over a generic DoCommand call.
-	doTeleopStart  = "teleop_start"
-	doTeleopMove   = "teleop_move"
-	doTeleopStop   = "teleop_stop"
-	doTeleopStatus = "teleop_status"
 
 	teleopStatusPollInterval = time.Second
 	teleopProbeTimeout       = 2 * time.Second
@@ -181,12 +172,17 @@ func newTeleopMover(
 	return tm, nil
 }
 
-// deltaPoseInFrameJSON builds the protojson-encoded PoseInFrame string used as
-// the value of both teleop_start's destination and teleop_move's payload. The
-// orientation is always the identity orientation vector (o_z=1, theta=0):
-// this mover only ever expresses translation, never rotation.
-func deltaPoseInFrameJSON(frame string, dx, dy, dz float64) (json.RawMessage, error) {
-	pif := &commonpb.PoseInFrame{
+// teleopMarshalOpts renders protojson with original (snake_case) proto field
+// names and includes zero-valued fields, matching the wire examples in
+// docs/SPEC-motion-teleop.md.
+var teleopMarshalOpts = protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}
+
+// deltaPoseInFrame builds the PoseInFrame proto used as both teleop_start's
+// destination and teleop_move's payload. The orientation is always the
+// identity orientation vector (o_z=1, theta=0): this mover only ever
+// expresses translation, never rotation.
+func deltaPoseInFrame(frame string, dx, dy, dz float64) *commonpb.PoseInFrame {
+	return &commonpb.PoseInFrame{
 		ReferenceFrame: frame,
 		Pose: &commonpb.Pose{
 			X:  dx,
@@ -195,12 +191,6 @@ func deltaPoseInFrameJSON(frame string, dx, dy, dz float64) (json.RawMessage, er
 			OZ: 1,
 		},
 	}
-	opts := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}
-	b, err := opts.Marshal(pif)
-	if err != nil {
-		return nil, err
-	}
-	return json.RawMessage(b), nil
 }
 
 // start (re)registers the teleop pipeline for this component. Per teleop.go,
@@ -210,25 +200,17 @@ func deltaPoseInFrameJSON(frame string, dx, dy, dz float64) (json.RawMessage, er
 // against go.viam.com/rdk@v1.7.0/services/motion/builtin/teleop.go, not a
 // typo carried over from the spec.
 func (m *teleopMover) start(ctx context.Context) error {
-	dest, err := deltaPoseInFrameJSON(m.componentName, 0, 0, 0)
-	if err != nil {
-		return errors.Wrap(err, "failed to build teleop_start destination")
-	}
-
-	envelope := struct {
-		ComponentName string          `json:"component_name"`
-		Destination   json.RawMessage `json:"destination"`
-	}{
+	req := &motionpb.MoveRequest{
 		ComponentName: m.componentName,
-		Destination:   dest,
+		Destination:   deltaPoseInFrame(m.componentName, 0, 0, 0),
 	}
-	payload, err := json.Marshal(envelope)
+	payload, err := teleopMarshalOpts.Marshal(req)
 	if err != nil {
 		return errors.Wrap(err, "failed to build teleop_start payload")
 	}
 
 	_, err = m.motionSvc.DoCommand(ctx, map[string]interface{}{
-		doTeleopStart: string(payload),
+		motionbuiltin.DoTeleopStart: string(payload),
 	})
 	return err
 }
@@ -237,14 +219,14 @@ func (m *teleopMover) start(ctx context.Context) error {
 // accumulates a target locally: each call carries only this tick's delta, and
 // the pipeline resolves it against its own live planning head.
 func (m *teleopMover) step(ctx context.Context, dx, dy, dz float64) error {
-	poseBytes, err := deltaPoseInFrameJSON(m.componentName, dx, dy, dz)
+	poseBytes, err := teleopMarshalOpts.Marshal(deltaPoseInFrame(m.componentName, dx, dy, dz))
 	if err != nil {
 		return errors.Wrap(err, "failed to build teleop_move payload")
 	}
 
 	_, err = m.motionSvc.DoCommand(ctx, map[string]interface{}{
-		doTeleopMove:     string(poseBytes),
-		"component_name": m.componentName,
+		motionbuiltin.DoTeleopMove: string(poseBytes),
+		"component_name":           m.componentName,
 	})
 	return err
 }
@@ -252,7 +234,7 @@ func (m *teleopMover) step(ctx context.Context, dx, dy, dz float64) error {
 // stop tears down the teleop pipeline and stops the arm. teleop_stop does not
 // stop the arm by itself, so the two are always paired here.
 func (m *teleopMover) stop(ctx context.Context) error {
-	if _, err := m.motionSvc.DoCommand(ctx, map[string]interface{}{doTeleopStop: true}); err != nil {
+	if _, err := m.motionSvc.DoCommand(ctx, map[string]interface{}{motionbuiltin.DoTeleopStop: true}); err != nil {
 		m.logger.Warnw("failed to stop teleop pipeline", "error", err)
 	}
 	return m.arm.Stop(ctx, nil)
@@ -295,20 +277,29 @@ func (m *teleopMover) probe(ctx context.Context) error {
 		}
 	}
 
+	// About two seconds elapsed with no plan_count advance and no reported
+	// error. Per spec, only an explicit error fails construction -- a slow
+	// first plan is plausible -- but this is also exactly the shape a
+	// misconfigured reference_frame could take if it never surfaces through
+	// teleop_status in time, so it must not pass without a trace.
+	m.logger.Warnf(
+		"teleop startup probe: no plan confirmed and no error reported after %s for reference_frame %q; continuing, but the arm may not actually respond to movement",
+		teleopProbeTimeout, m.componentName,
+	)
 	return nil
 }
 
 // pollOnce issues a single teleop_status request and extracts the fields the
 // mover cares about.
 func (m *teleopMover) pollOnce(ctx context.Context) (planCount float64, errStr string, err error) {
-	resp, err := m.motionSvc.DoCommand(ctx, map[string]interface{}{doTeleopStatus: true})
+	resp, err := m.motionSvc.DoCommand(ctx, map[string]interface{}{motionbuiltin.DoTeleopStatus: true})
 	if err != nil {
 		return 0, "", err
 	}
 
-	status, ok := resp[doTeleopStatus].(map[string]interface{})
+	status, ok := resp[motionbuiltin.DoTeleopStatus].(map[string]interface{})
 	if !ok {
-		return 0, "", errors.Errorf("unexpected %s response shape: %#v", doTeleopStatus, resp[doTeleopStatus])
+		return 0, "", errors.Errorf("unexpected %s response shape: %#v", motionbuiltin.DoTeleopStatus, resp[motionbuiltin.DoTeleopStatus])
 	}
 
 	planCount = toFloat64(status["plan_count"])
@@ -350,15 +341,15 @@ func (m *teleopMover) pollStatus(ctx context.Context) {
 }
 
 func (m *teleopMover) checkStatus(ctx context.Context) {
-	resp, err := m.motionSvc.DoCommand(ctx, map[string]interface{}{doTeleopStatus: true})
+	resp, err := m.motionSvc.DoCommand(ctx, map[string]interface{}{motionbuiltin.DoTeleopStatus: true})
 	if err != nil {
 		m.logger.Errorw("failed to poll teleop status", "error", err)
 		return
 	}
 
-	status, ok := resp[doTeleopStatus].(map[string]interface{})
+	status, ok := resp[motionbuiltin.DoTeleopStatus].(map[string]interface{})
 	if !ok {
-		m.logger.Errorw("unexpected teleop_status response shape", "response", resp[doTeleopStatus])
+		m.logger.Errorw("unexpected teleop_status response shape", "response", resp[motionbuiltin.DoTeleopStatus])
 		return
 	}
 

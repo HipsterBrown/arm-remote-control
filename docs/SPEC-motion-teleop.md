@@ -27,11 +27,36 @@ a roll. The direct path cannot produce this.
 - No runtime mode switching. The service is `AlwaysRebuild`, so a config change
   rebuilds it.
 
-## No dependency change
+## Dependency: RDK bump required
 
-`go.viam.com/rdk v1.7.0`, already required, exports what is needed from
-`services/motion/builtin`: `DoTeleopStart`, `DoTeleopMove`, `DoTeleopStop`,
-`DoTeleopStatus`. Do not bump the RDK and do not add a `replace`.
+**Correction (post-implementation):** this section originally said
+`go.viam.com/rdk v1.7.0` was already required and that no dependency bump was
+needed. That was wrong. It was written from a working tree where the RDK had
+already been upgraded, not from `main`, which is the branch this spec's
+implementation was cut from. On `main`, `go.mod` pins `go.viam.com/rdk
+v0.83.0`, and `rdk@v0.83.0/services/motion/builtin` has no `teleop.go` at
+all -- no `DoTeleopStart`/`DoTeleopMove`/`DoTeleopStop`/`DoTeleopStatus`
+constants, no teleop pipeline. Worse, `v0.83.0` transitively pins
+`go.viam.com/api v0.1.455`, whose `pb.MoveRequest.ComponentName` is a
+`*ResourceName` (a deprecated field), not the plain string that `teleop.go`
+in v1.7.0 actually reads; that field only became a plain string around
+`go.viam.com/api v0.1.579`. So adopting this feature is not free: it
+requires bumping to `go.viam.com/rdk v1.7.0` (`go get
+go.viam.com/rdk@v1.7.0 && go mod tidy`), which also pulls in
+`go.viam.com/api v0.1.579+`.
+
+The sibling branch `poll-input-events` already pins `go.viam.com/rdk v1.7.0`,
+so this is not new scope invented for teleop -- `main` is simply behind, and
+the two branches should combine cleanly on the dependency front as well as
+the input-delivery front (see "Open question for the author" below).
+
+Once the bump lands, use the real exported symbols rather than hand-rolling
+the wire format: the `DoTeleopStart`/`DoTeleopMove`/`DoTeleopStop`/
+`DoTeleopStatus` constants from `go.viam.com/rdk/services/motion/builtin`,
+and build `teleop_start`'s envelope from the real `pb.MoveRequest`
+(`go.viam.com/api/service/motion/v1`) via `protojson.Marshal`, since
+`component_name` is expressible as a plain string field once the bump is in
+place.
 
 ## Configuration
 
