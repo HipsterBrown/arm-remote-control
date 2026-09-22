@@ -134,7 +134,9 @@ func resolveMaxContinuousMotion(conf *Config) time.Duration {
 // not add other abstractions around it.
 type mover interface {
 	// step applies a relative delta: translation in millimetres, rotation as
-	// a small orientation. Never accumulated across calls.
+	// a small orientation. Translation is applied in the arm/reference
+	// frame; rotation is composed onto the tool. Never accumulated across
+	// calls.
 	step(ctx context.Context, delta spatialmath.Pose) error
 	// stop halts motion. Always also calls arm.Stop where relevant.
 	stop(ctx context.Context) error
@@ -147,6 +149,17 @@ type directMover struct {
 	arm arm.Arm
 }
 
+// step adds the delta's translation in the arm's own frame and composes its
+// rotation onto the tool.
+//
+// These are deliberately two different operations. Compose(current, delta)
+// with a delta carrying both would rotate the translation into the tool
+// frame as well, which is a different control scheme: the operator's
+// "forward" would change every time they twisted the wrist.
+//
+// Compose(a, b) is A(B(x)), so composing a zero-translation rotation leaves
+// the point untouched and yields current ∘ delta -- a tool-frame rotation,
+// which is what a wrist physically does.
 func (m *directMover) step(ctx context.Context, delta spatialmath.Pose) error {
 	currentPose, err := m.arm.EndPosition(ctx, nil)
 	if err != nil {
@@ -159,7 +172,10 @@ func (m *directMover) step(ctx context.Context, delta spatialmath.Pose) error {
 	point.Y += d.Y
 	point.Z += d.Z
 
-	newPose := spatialmath.NewPose(point, currentPose.Orientation())
+	newPose := spatialmath.Compose(
+		spatialmath.NewPose(point, currentPose.Orientation()),
+		spatialmath.NewPoseFromOrientation(delta.Orientation()),
+	)
 	return m.arm.MoveToPosition(ctx, newPose, nil)
 }
 

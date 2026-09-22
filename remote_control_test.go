@@ -2,6 +2,7 @@ package armremotecontrol
 
 import (
 	"context"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"go.viam.com/rdk/services/motion"
 	motionbuiltin "go.viam.com/rdk/services/motion/builtin"
 	"go.viam.com/rdk/spatialmath"
+	rdkutils "go.viam.com/rdk/utils"
 )
 
 // fakeArm satisfies arm.Arm. Embedding a nil arm.Arm promotes the rest of the
@@ -189,6 +191,85 @@ func TestDirectModeSelectedWhenMotionServiceUnset(t *testing.T) {
 	}
 	if fa.getStopCalls() != 1 {
 		t.Fatalf("expected arm.Stop to be called once, got %d", fa.getStopCalls())
+	}
+}
+
+func TestPureRotationDoesNotTranslate(t *testing.T) {
+	fa := &fakeArm{endPos: spatialmath.NewPose(
+		r3.Vector{X: 100, Y: 200, Z: 300},
+		spatialmath.NewZeroOrientation(),
+	)}
+	m := &directMover{arm: fa}
+
+	// 15 degrees of yaw, zero translation.
+	delta := spatialmath.NewPose(r3.Vector{}, &spatialmath.EulerAngles{Yaw: rdkutils.DegToRad(15)})
+	if err := m.step(context.Background(), delta); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	calls := fa.getMoveCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 MoveToPosition call, got %d", len(calls))
+	}
+	// Tolerance, not equality: Compose round-trips through dual quaternions,
+	// so an untouched 100 comes back as 99.999999999999986. That is the
+	// point being preserved, not a translation.
+	got := calls[0].Point()
+	const eps = 1e-9
+	if math.Abs(got.X-100) > eps || math.Abs(got.Y-200) > eps || math.Abs(got.Z-300) > eps {
+		t.Fatalf("a pure rotation must not move the tool: expected (100,200,300), got (%v,%v,%v)", got.X, got.Y, got.Z)
+	}
+}
+
+func TestPureTranslationDoesNotRotate(t *testing.T) {
+	start := spatialmath.NewPose(
+		r3.Vector{X: 100, Y: 200, Z: 300},
+		&spatialmath.EulerAngles{Pitch: rdkutils.DegToRad(30)},
+	)
+	fa := &fakeArm{endPos: start}
+	m := &directMover{arm: fa}
+
+	delta := spatialmath.NewPose(r3.Vector{X: 10}, spatialmath.NewZeroOrientation())
+	if err := m.step(context.Background(), delta); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	got := fa.getMoveCalls()[0]
+	if got.Point().X != 110 {
+		t.Fatalf("expected X to advance to 110, got %v", got.Point().X)
+	}
+	if !spatialmath.OrientationAlmostEqual(got.Orientation(), start.Orientation()) {
+		t.Fatalf("a pure translation must not rotate the tool: orientation changed")
+	}
+}
+
+func TestRotationIsToolFrameNotBaseFrame(t *testing.T) {
+	startOrient := &spatialmath.EulerAngles{Yaw: rdkutils.DegToRad(90)}
+	fa := &fakeArm{endPos: spatialmath.NewPose(r3.Vector{}, startOrient)}
+	m := &directMover{arm: fa}
+
+	deltaOrient := &spatialmath.EulerAngles{Pitch: rdkutils.DegToRad(30)}
+	if err := m.step(context.Background(),
+		spatialmath.NewPose(r3.Vector{}, deltaOrient)); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+	got := fa.getMoveCalls()[0].Orientation()
+
+	toolFrame := spatialmath.Compose(
+		spatialmath.NewPoseFromOrientation(startOrient),
+		spatialmath.NewPoseFromOrientation(deltaOrient),
+	).Orientation()
+	baseFrame := spatialmath.Compose(
+		spatialmath.NewPoseFromOrientation(deltaOrient),
+		spatialmath.NewPoseFromOrientation(startOrient),
+	).Orientation()
+
+	// Guard the test itself: if these two agreed, it would prove nothing.
+	if spatialmath.OrientationAlmostEqual(toolFrame, baseFrame) {
+		t.Fatalf("test is not discriminating: pick start/delta rotations that do not commute")
+	}
+	if !spatialmath.OrientationAlmostEqual(got, toolFrame) {
+		t.Fatalf("expected tool-frame composition (current then delta), got base-frame")
 	}
 }
 
