@@ -68,10 +68,10 @@ type Config struct {
 	// deadman to DISABLED whenever the attribute is absent, inverting the
 	// safe default. nil means true.
 	RequireEnable *bool `json:"require_enable,omitempty"`
-	// MaxContinuousMotion is the dead-operator timeout in seconds. A pointer
-	// for the same reason: an explicit 0 disables the timer, while an
-	// omitted field must mean the default, and a plain int cannot tell
-	// those apart.
+	// MaxContinuousMotion is the dead-operator timeout in seconds. A pointer,
+	// but for a different reason than RequireEnable: an explicit 0 disables
+	// the timer, while an omitted field must mean the default, and a plain
+	// int cannot tell those apart.
 	MaxContinuousMotion *int `json:"max_continuous_motion,omitempty"`
 }
 
@@ -99,7 +99,31 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		deps = append(deps, cfg.Gripper)
 	}
 
+	if cfg.MaxContinuousMotion != nil && *cfg.MaxContinuousMotion < 0 {
+		return nil, nil, resource.NewConfigValidationError(path, errors.New("max_continuous_motion must not be negative"))
+	}
+
 	return deps, nil, nil
+}
+
+// resolveRequireEnable defaults an omitted require_enable to true. See the
+// field comment: the omission case is the safety-critical one.
+func resolveRequireEnable(conf *Config) bool {
+	if conf.RequireEnable == nil {
+		return true
+	}
+	return *conf.RequireEnable
+}
+
+// resolveMaxContinuousMotion defaults an omitted max_continuous_motion to
+// defaultMaxContinuousMotion, while honouring an explicit 0 as "disabled".
+// The duration is stored rather than the raw seconds so tests can use
+// sub-second timeouts without widening the config surface.
+func resolveMaxContinuousMotion(conf *Config) time.Duration {
+	if conf.MaxContinuousMotion == nil {
+		return defaultMaxContinuousMotion
+	}
+	return time.Duration(*conf.MaxContinuousMotion) * time.Second
 }
 
 // mover applies teleop deltas to the arm. It is the only seam between the
@@ -430,26 +454,6 @@ func (m *teleopMover) recordSuccess() {
 	m.mu.Lock()
 	m.consecutiveErrs = 0
 	m.mu.Unlock()
-}
-
-// resolveRequireEnable defaults an omitted require_enable to true. See the
-// field comment: the omission case is the safety-critical one.
-func resolveRequireEnable(conf *Config) bool {
-	if conf.RequireEnable == nil {
-		return true
-	}
-	return *conf.RequireEnable
-}
-
-// resolveMaxContinuousMotion defaults an omitted max_continuous_motion to
-// defaultMaxContinuousMotion, while honouring an explicit 0 as "disabled".
-// The duration is stored rather than the raw seconds so tests can use
-// sub-second timeouts without widening the config surface.
-func resolveMaxContinuousMotion(conf *Config) time.Duration {
-	if conf.MaxContinuousMotion == nil {
-		return defaultMaxContinuousMotion
-	}
-	return time.Duration(*conf.MaxContinuousMotion) * time.Second
 }
 
 // newMover selects and constructs the mover for conf: the direct arm path

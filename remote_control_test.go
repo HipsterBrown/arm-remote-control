@@ -751,3 +751,27 @@ func TestValidateOmitsGripperDependencyWhenUnset(t *testing.T) {
 		t.Fatalf("expected exactly the arm and controller deps, got %v", deps)
 	}
 }
+
+func TestValidateRejectsNegativeMaxContinuousMotion(t *testing.T) {
+	negative := -5
+	_, _, err := (&Config{
+		ArmName:             "arm-1",
+		InputControllerName: "gamepad-1",
+		MaxContinuousMotion: &negative,
+	}).Validate("components.0")
+	if err == nil {
+		t.Fatalf("expected a negative max_continuous_motion to fail validation")
+	}
+}
+
+func TestValidateAcceptsZeroMaxContinuousMotion(t *testing.T) {
+	zero := 0
+	_, _, err := (&Config{
+		ArmName:             "arm-1",
+		InputControllerName: "gamepad-1",
+		MaxContinuousMotion: &zero,
+	}).Validate("components.0")
+	if err != nil {
+		t.Fatalf("expected max_continuous_motion:0 (timer disabled) to be valid, got: %v", err)
+	}
+}
