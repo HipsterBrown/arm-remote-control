@@ -739,7 +739,13 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		if arc.connected {
 			arc.connected = false
 			arc.logger.Info("input controller disconnected, stopping arm")
-			arc.haltMotion(ctx)
+			// Force it: motionSince zero does not mean the arm is
+			// stationary (an idle tick clears it without stopping
+			// anything, and in teleop mode the pipeline stays live
+			// independently of whether we're issuing moves), and a
+			// disconnect is a fault, not a normal idle -- it must stop
+			// the arm regardless of what our own bookkeeping believes.
+			arc.forceHalt(ctx, now)
 		}
 		return
 	}
@@ -757,11 +763,9 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 
 		if !alreadyLatched {
 			arc.logger.Error("E-STOP engaged; press Start to clear")
-			// haltMotion only stops when motionSince is non-zero, but an
-			// E-stop must stop the arm regardless of what the service
-			// believes it was doing.
-			arc.motionSince = now
-			arc.haltMotion(ctx)
+			// Force it: an E-stop must stop the arm regardless of what
+			// motionSince claims about current commanded motion.
+			arc.forceHalt(ctx, now)
 			arc.stopGripper(ctx)
 		}
 		return
@@ -828,14 +832,16 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 // clears motionSince. Calling it while already idle is a no-op: that is what
 // keeps a released deadman from calling mover.stop on every subsequent tick,
 // which matters because in teleop mode stop tears down and re-establishes the
-// whole motion-service pipeline.
+// whole motion-service pipeline. In short, haltMotion is "stop if we were
+// moving" -- see forceHalt below for "stop regardless", which fault
+// conditions need instead.
 //
 // This is meant to be the one chokepoint for "stop, and remember we
 // stopped": every loop-side stop -- the deadman gate, the E-stop gate,
 // Task 7's dead-operator timer, and the controller-disconnect branch --
-// routes through here rather than calling arc.mover.stop directly. Close's
-// teardown call is the one exception, since by then there is no motionSince
-// left to keep consistent.
+// routes through here (the latter two via forceHalt) rather than calling
+// arc.mover.stop directly. Close's teardown call is the one exception, since
+// by then there is no motionSince left to keep consistent.
 //
 // mover.stop, not arm.Stop directly, is what every one of those call sites
 // gets by routing through here: the teleop mover must also tear down its
@@ -858,6 +864,23 @@ func (arc *armRemoteControlGamepad) haltMotion(ctx context.Context) {
 	if err := arc.mover.stop(ctx); err != nil {
 		arc.logger.Errorw("failed to stop motion", "error", err)
 	}
+}
+
+// forceHalt halts unconditionally: it sets motionSince to now, so
+// haltMotion's guard always sees a run in flight and always calls
+// mover.stop, regardless of what motionSince previously claimed.
+//
+// This is for fault conditions only -- currently the E-stop gate and the
+// controller-disconnect branch. Both need it for the same reason:
+// motionSince == 0 means "this service isn't currently commanding motion",
+// which is weaker than "the arm is stationary". An idle tick clears
+// motionSince without stopping anything, and in teleop mode the pipeline
+// established by teleop_start stays live independently of whether we're
+// sending teleop_move calls. A fault must not read either of those as
+// "nothing to stop".
+func (arc *armRemoteControlGamepad) forceHalt(ctx context.Context, now time.Time) {
+	arc.motionSince = now
+	arc.haltMotion(ctx)
 }
 
 // stopGripper halts the gripper if one is configured. Unlike the grab/open
