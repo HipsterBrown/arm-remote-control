@@ -1387,6 +1387,35 @@ func TestDeadmanReleaseStopsTheGripper(t *testing.T) {
 	arc.activeBackgroundWorkers.Wait()
 }
 
+// TestDisconnectStopsTheGripper mirrors TestEStopStopsTheGripper and
+// TestDeadmanReleaseStopsTheGripper: stopGripper has three call sites (E-stop,
+// deadman release, disconnect), and a controller vanishing mid-grasp must not
+// leave the jaws closing any more than a released deadman or a latched E-stop
+// would.
+func TestDisconnectStopsTheGripper(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+
+	// Controller vanishes while the grab is still in flight.
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonSouth: {Event: input.Disconnect},
+	}, time.Now())
+
+	if _, _, stop := fg.counts(); stop != 1 {
+		t.Fatalf("expected a vanished controller to stop an in-flight gripper operation, got %d Stop calls", stop)
+	}
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
+}
+
 // TestGripperDispatchRequiresTheDeadman pins the gating order structurally
 // documented in tick's comment (see docs/SPEC-teleop-safety-gripper.md
 // "Gating order"): the gripper dispatch sits below the deadman gate and the
