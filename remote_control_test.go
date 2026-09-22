@@ -329,6 +329,13 @@ func TestTeleopModeIssuesStartOnceWithComponentNameAndReferenceFrame(t *testing.
 	if req.GetDestination().GetReferenceFrame() != "gripper-1" {
 		t.Fatalf("expected destination.reference_frame gripper-1, got %q", req.GetDestination().GetReferenceFrame())
 	}
+
+	// deltaPoseInFrame now computes this from NewZeroPose rather than
+	// hardcoding OZ:1 -- pin the wire identity.
+	if p := req.GetDestination().GetPose(); p.GetX() != 0 || p.GetY() != 0 || p.GetZ() != 0 ||
+		p.GetOX() != 0 || p.GetOY() != 0 || p.GetOZ() != 1 || p.GetTheta() != 0 {
+		t.Fatalf("expected an identity zero destination pose, got %+v", p)
+	}
 }
 
 // A 5-DoF arm cannot hold its tool orientation through a sideways move, so
@@ -474,8 +481,7 @@ func TestTeleopMoveCarriesOrientation(t *testing.T) {
 	}
 	// Explicit, not deferred. Defers are LIFO, so the deferred wg.Wait()
 	// above would run BEFORE a deferred cancel() and block forever on the
-	// pollStatus goroutine, which only exits on cancelCtx.Done(). Every
-	// existing teleop test in this file cancels here for the same reason.
+	// pollStatus goroutine, which only exits on cancelCtx.Done().
 	cancel()
 
 	delta := spatialmath.NewPose(
@@ -487,11 +493,17 @@ func TestTeleopMoveCarriesOrientation(t *testing.T) {
 	}
 
 	calls := fms.callsFor(motionbuiltin.DoTeleopMove)
+	if len(calls) < 1 {
+		t.Fatalf("expected at least 1 teleop_move call, got %d", len(calls))
+	}
 	last := calls[len(calls)-1]
 	pif := unaryPoseInFrame(t, last[motionbuiltin.DoTeleopMove].(string))
 
 	want := delta.Orientation().OrientationVectorDegrees()
 	got := pif.Pose
+	// A 10-degree roll gives a non-zero OV theta; a different axis may not,
+	// so this check is a proxy for "not the identity orientation" and not a
+	// general non-identity test.
 	if got.Theta == 0 {
 		t.Fatalf("expected a non-zero theta for a 10-degree roll, got the identity orientation")
 	}
@@ -501,6 +513,8 @@ func TestTeleopMoveCarriesOrientation(t *testing.T) {
 		t.Fatalf("expected ov (%v,%v,%v,%v), got (%v,%v,%v,%v)",
 			want.OX, want.OY, want.OZ, want.Theta, got.OX, got.OY, got.OZ, got.Theta)
 	}
+	// Exact compare: X=5 is a pass-through of the delta's translation, not
+	// arithmetic through Compose, so it has no rounding to tolerate.
 	if got.X != 5 {
 		t.Fatalf("expected the translation to survive alongside the rotation, got X=%v", got.X)
 	}
