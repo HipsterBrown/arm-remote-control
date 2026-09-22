@@ -93,10 +93,11 @@ type Config struct {
 	PositionOnly bool `json:"position_only,omitempty"`
 	// RotationStepSize is the maximum rotation in degrees per axis per tick
 	// at full stick deflection. Like PositionOnly, this is a plain float64
-	// rather than a pointer: the zero value means "unset", there is no
-	// third state to distinguish from unset, and falling back to
-	// defaultRotationStepSize is a safe, conventional default rather than a
-	// safety-critical one.
+	// rather than a pointer: 0 could be read as "no rotation", a coherent
+	// reading unlike step_size's, but it is deliberately treated as unset
+	// to match step_size. An operator who wants no rotation should simply
+	// not deflect the stick. Falling back to defaultRotationStepSize is a
+	// conventional default rather than a safety-critical one.
 	RotationStepSize float64 `json:"rotation_step_size,omitempty"`
 }
 
