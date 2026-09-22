@@ -545,7 +545,16 @@ type armRemoteControlGamepad struct {
 
 	// motionSince is the start of the current unbroken run of commanded
 	// motion, zero when idle. Loop-owned; see the dead-operator timer.
+	//
+	// motionSince is a run timer only -- it resets on every idle tick, by
+	// design, so Task 7's dead-operator timer measures one unbroken run.
+	// needsStop is a latch instead: it is set whenever a step is dispatched
+	// and cleared only once mover.stop has actually fired, so an idle tick
+	// in between (stick centred, deadman still held) does not erase the
+	// fact that the mover was told to move and still needs to be stopped.
+	// haltMotion guards on needsStop, not motionSince.
 	motionSince time.Time
+	needsStop   bool
 
 	activeBackgroundWorkers sync.WaitGroup
 }
@@ -739,13 +748,12 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		if arc.connected {
 			arc.connected = false
 			arc.logger.Info("input controller disconnected, stopping arm")
-			// Force it: motionSince zero does not mean the arm is
-			// stationary (an idle tick clears it without stopping
-			// anything, and in teleop mode the pipeline stays live
-			// independently of whether we're issuing moves), and a
-			// disconnect is a fault, not a normal idle -- it must stop
-			// the arm regardless of what our own bookkeeping believes.
-			arc.forceHalt(ctx, now)
+			// Force it: needsStop false does not mean the arm is
+			// stationary -- the last commanded move may still be
+			// executing (see forceHalt's doc) -- and a disconnect is a
+			// fault, not a normal idle, so it must stop the arm
+			// regardless of what our own bookkeeping believes.
+			arc.forceHalt(ctx)
 		}
 		return
 	}
@@ -764,8 +772,9 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		if !alreadyLatched {
 			arc.logger.Error("E-STOP engaged; press Start to clear")
 			// Force it: an E-stop must stop the arm regardless of what
-			// motionSince claims about current commanded motion.
-			arc.forceHalt(ctx, now)
+			// needsStop claims about a step having been dispatched (see
+			// forceHalt's doc).
+			arc.forceHalt(ctx)
 			arc.stopGripper(ctx)
 		}
 		return
@@ -808,8 +817,13 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	dz := arc.zAxis(events) * arc.stepSize
 
 	if dx == 0 && dy == 0 && dz == 0 {
-		// An idle tick ends the run. See the spec: the timer exists to catch
-		// a controller that went away, not an operator who paused.
+		// An idle tick ends the run timer. See the spec: the timer exists to
+		// catch a controller that went away, not an operator who paused.
+		// needsStop is untouched here -- an idle tick is not a stop, and
+		// this is exactly the gap TestDeadmanReleaseStopsAfterAnIdleTick
+		// pins: the operator centres the stick before releasing the
+		// deadman, and that idle tick must not erase the fact that the arm
+		// still needs to be stopped once the deadman does release.
 		arc.motionSince = time.Time{}
 		return
 	}
@@ -817,6 +831,7 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	if arc.motionSince.IsZero() {
 		arc.motionSince = now
 	}
+	arc.needsStop = true
 
 	stepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	err := arc.mover.step(stepCtx, dx, dy, dz)
@@ -828,58 +843,73 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	}
 }
 
-// haltMotion stops the mover if a run of commanded motion is in flight, and
-// clears motionSince. Calling it while already idle is a no-op: that is what
-// keeps a released deadman from calling mover.stop on every subsequent tick,
-// which matters because in teleop mode stop tears down and re-establishes the
+// haltMotion stops the mover if a step is still owed a stop, and clears
+// needsStop. Calling it while already idle is a no-op: that is what keeps a
+// released deadman from calling mover.stop on every subsequent tick, which
+// matters because in teleop mode stop tears down and re-establishes the
 // whole motion-service pipeline. In short, haltMotion is "stop if we were
 // moving" -- see forceHalt below for "stop regardless", which fault
 // conditions need instead.
 //
+// It guards on needsStop, not motionSince: motionSince is Task 7's run
+// timer and resets on every idle tick, by design, while needsStop is a
+// latch that survives idle ticks until the mover is actually told to stop.
+// Guarding on motionSince here was the bug -- an operator centres the stick
+// (an idle tick, clearing motionSince) before releasing the deadman, so by
+// the time the release lands there was nothing left to signal that a stop
+// was still owed.
+//
 // This is meant to be the one chokepoint for "stop, and remember we
-// stopped": every loop-side stop -- the deadman gate, the E-stop gate,
-// Task 7's dead-operator timer, and the controller-disconnect branch --
-// routes through here (the latter two via forceHalt) rather than calling
-// arc.mover.stop directly. Close's teardown call is the one exception, since
-// by then there is no motionSince left to keep consistent.
+// stopped": every loop-side stop routes through here rather than calling
+// arc.mover.stop directly. The deadman gate and Task 7's dead-operator timer
+// call it directly; the E-stop gate and the controller-disconnect branch
+// call it via forceHalt, since those two must stop unconditionally rather
+// than relying on needsStop already being set. Close's teardown call is the
+// one exception, since by then there is no state left to keep consistent.
 //
 // mover.stop, not arm.Stop directly, is what every one of those call sites
 // gets by routing through here: the teleop mover must also tear down its
 // pipeline, and teleop_stop alone does not halt the arm.
 //
-// haltMotion is movement-goroutine-only: it writes motionSince, which is
-// unguarded loop-owned state (see the field comment), with no mutex. Do not
-// call it from DoCommand or any other goroutine. The spec anticipates
-// exposing the E-stop over DoCommand; wiring that straight into haltMotion
-// would look like the obvious move -- this is the designated stop path --
-// but it would race motionSince against the movement loop and could call
-// mover.stop concurrently with a step already in flight. An RPC-triggered
-// stop needs to set a mu-guarded (or atomic) flag for tick itself to poll
-// and act on, not call this helper directly.
+// haltMotion is movement-goroutine-only: it writes needsStop, unguarded
+// loop-owned state (see the field comment), with no mutex. It does not
+// touch motionSince -- that stays purely Task 7's run timer, written only
+// where it already is (cleared on an idle tick, set on the first step of a
+// run), so haltMotion changing it here would be a second, competing writer.
+// Do not call haltMotion from DoCommand or any other goroutine. The spec
+// anticipates exposing the E-stop over DoCommand; wiring that straight into
+// haltMotion would look like the obvious move -- this is the designated
+// stop path -- but it would race needsStop against the movement loop and
+// could call mover.stop concurrently with a step already in flight. An
+// RPC-triggered stop needs to set a mu-guarded (or atomic) flag for tick
+// itself to poll and act on, not call this helper directly.
 func (arc *armRemoteControlGamepad) haltMotion(ctx context.Context) {
-	if arc.motionSince.IsZero() {
+	if !arc.needsStop {
 		return
 	}
-	arc.motionSince = time.Time{}
+	arc.needsStop = false
 	if err := arc.mover.stop(ctx); err != nil {
 		arc.logger.Errorw("failed to stop motion", "error", err)
 	}
 }
 
-// forceHalt halts unconditionally: it sets motionSince to now, so
-// haltMotion's guard always sees a run in flight and always calls
-// mover.stop, regardless of what motionSince previously claimed.
+// forceHalt halts unconditionally: it sets needsStop, so haltMotion's guard
+// always sees a stop owed and always calls mover.stop, regardless of
+// whether a step was ever dispatched.
 //
 // This is for fault conditions only -- currently the E-stop gate and the
-// controller-disconnect branch. Both need it for the same reason:
-// motionSince == 0 means "this service isn't currently commanding motion",
-// which is weaker than "the arm is stationary". An idle tick clears
-// motionSince without stopping anything, and in teleop mode the pipeline
-// established by teleop_start stays live independently of whether we're
-// sending teleop_move calls. A fault must not read either of those as
-// "nothing to stop".
-func (arc *armRemoteControlGamepad) forceHalt(ctx context.Context, now time.Time) {
-	arc.motionSince = now
+// controller-disconnect branch. Both need it for the same reason: neither
+// can assume "no step was dispatched (needsStop false)" means "the arm is
+// stationary". Motion the service commanded can still be executing after
+// tick moves on: the motion-service teleop pipeline dispatches through
+// arm.MoveThroughJointPositions with waitAtEnd: false, which returns before
+// the arm reaches the target, and EMA-smooths the commanded joints so they
+// lag the goal by design; directMover's step similarly runs under a 5s
+// context and can return while the arm is still executing the move it just
+// sent. A fault must not read the absence of a fresh command as "nothing to
+// stop".
+func (arc *armRemoteControlGamepad) forceHalt(ctx context.Context) {
+	arc.needsStop = true
 	arc.haltMotion(ctx)
 }
 

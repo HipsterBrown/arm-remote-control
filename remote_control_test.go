@@ -829,6 +829,35 @@ func TestDeadmanReleaseStopsExactlyOnce(t *testing.T) {
 	}
 }
 
+// TestDeadmanReleaseStopsAfterAnIdleTick pins the human-realistic release
+// sequence: centre the stick first, then let go of the deadman. That is how
+// an operator actually stops -- not the single combined transition
+// TestDeadmanReleaseStopsExactlyOnce drives. The intervening idle tick (stick
+// centred, deadman still held) must not defeat the eventual stop.
+func TestDeadmanReleaseStopsAfterAnIdleTick(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	moving := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+	idle := map[input.Control]input.Event{
+		input.ButtonLT: {Event: input.ButtonHold},
+	}
+	released := map[input.Control]input.Event{
+		input.ButtonLT: {Event: input.ButtonRelease},
+	}
+
+	arc.tick(context.Background(), moving, time.Now())
+	arc.tick(context.Background(), idle, time.Now())
+	arc.tick(context.Background(), released, time.Now())
+
+	if mv.stops() != 1 {
+		t.Fatalf("expected the deadman release to stop the arm even after an idle tick cleared motionSince, got %d stops", mv.stops())
+	}
+}
+
 func TestDeadmanCanBeDisabled(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
