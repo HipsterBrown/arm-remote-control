@@ -696,3 +696,58 @@ func TestTickStopsOnceOnDisconnect(t *testing.T) {
 		t.Fatalf("expected the latch to re-arm after reconnecting, got %d stop calls", mv.stops())
 	}
 }
+
+func TestOmittedSafetyFieldsDefaultSafe(t *testing.T) {
+	conf := &Config{ArmName: "arm-1", InputControllerName: "gamepad-1"}
+
+	if got := resolveRequireEnable(conf); !got {
+		t.Fatalf("expected an omitted require_enable to default to true (deadman enabled), got false")
+	}
+	if got := resolveMaxContinuousMotion(conf); got != defaultMaxContinuousMotion {
+		t.Fatalf("expected an omitted max_continuous_motion to default to %v, got %v", defaultMaxContinuousMotion, got)
+	}
+}
+
+func TestExplicitSafetyFieldsAreHonoured(t *testing.T) {
+	no := false
+	zero := 0
+	conf := &Config{RequireEnable: &no, MaxContinuousMotion: &zero}
+
+	if resolveRequireEnable(conf) {
+		t.Fatalf("expected an explicit require_enable:false to disable the deadman")
+	}
+	if got := resolveMaxContinuousMotion(conf); got != 0 {
+		t.Fatalf("expected an explicit max_continuous_motion:0 to disable the timer, got %v", got)
+	}
+}
+
+func TestValidateAddsGripperDependencyWhenSet(t *testing.T) {
+	deps, _, err := (&Config{
+		ArmName:             "arm-1",
+		InputControllerName: "gamepad-1",
+		Gripper:             "gripper-1",
+	}).Validate("components.0")
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	var found bool
+	for _, d := range deps {
+		if d == "gripper-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected gripper-1 in deps, got %v", deps)
+	}
+}
+
+func TestValidateOmitsGripperDependencyWhenUnset(t *testing.T) {
+	deps, _, err := (&Config{ArmName: "arm-1", InputControllerName: "gamepad-1"}).Validate("components.0")
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if len(deps) != 2 {
+		t.Fatalf("expected exactly the arm and controller deps, got %v", deps)
+	}
+}

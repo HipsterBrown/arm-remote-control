@@ -37,6 +37,8 @@ const (
 	// ponytail: fixed threshold for "repeatedly" failing; tune (or make
 	// configurable) if this proves too eager or too slow to trip in practice.
 	maxConsecutiveTeleopErrs = 3
+
+	defaultMaxContinuousMotion = 30 * time.Second
 )
 
 func init() {
@@ -58,6 +60,19 @@ type Config struct {
 	// ReferenceFrame is the frame deltas are expressed in when
 	// MotionServiceName is set. Defaults to ArmName. Ignored in direct mode.
 	ReferenceFrame string `json:"reference_frame,omitempty"`
+	// Gripper, when set, binds the gripper controls to this component.
+	// Unset leaves them as no-ops.
+	Gripper string `json:"gripper,omitempty"`
+	// RequireEnable is a *bool, not a bool, so that an omitted attribute is
+	// distinguishable from an explicit false. A plain bool would default the
+	// deadman to DISABLED whenever the attribute is absent, inverting the
+	// safe default. nil means true.
+	RequireEnable *bool `json:"require_enable,omitempty"`
+	// MaxContinuousMotion is the dead-operator timeout in seconds. A pointer
+	// for the same reason: an explicit 0 disables the timer, while an
+	// omitted field must mean the default, and a plain int cannot tell
+	// those apart.
+	MaxContinuousMotion *int `json:"max_continuous_motion,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid and important fields exist.
@@ -78,6 +93,10 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 
 	if cfg.MotionServiceName != "" {
 		deps = append(deps, motion.Named(cfg.MotionServiceName).String())
+	}
+
+	if cfg.Gripper != "" {
+		deps = append(deps, cfg.Gripper)
 	}
 
 	return deps, nil, nil
@@ -413,6 +432,26 @@ func (m *teleopMover) recordSuccess() {
 	m.mu.Unlock()
 }
 
+// resolveRequireEnable defaults an omitted require_enable to true. See the
+// field comment: the omission case is the safety-critical one.
+func resolveRequireEnable(conf *Config) bool {
+	if conf.RequireEnable == nil {
+		return true
+	}
+	return *conf.RequireEnable
+}
+
+// resolveMaxContinuousMotion defaults an omitted max_continuous_motion to
+// defaultMaxContinuousMotion, while honouring an explicit 0 as "disabled".
+// The duration is stored rather than the raw seconds so tests can use
+// sub-second timeouts without widening the config surface.
+func resolveMaxContinuousMotion(conf *Config) time.Duration {
+	if conf.MaxContinuousMotion == nil {
+		return defaultMaxContinuousMotion
+	}
+	return time.Duration(*conf.MaxContinuousMotion) * time.Second
+}
+
 // newMover selects and constructs the mover for conf: the direct arm path
 // when MotionServiceName is unset, or the motion service teleop pipeline
 // otherwise. There is no runtime switching between the two after this call.
@@ -460,6 +499,9 @@ type armRemoteControlGamepad struct {
 	initialized bool
 	stepSize    float64
 
+	requireEnable       bool
+	maxContinuousMotion time.Duration
+
 	// Button state tracking for continuous movement
 	movementTicker *time.Ticker
 	movementStop   chan struct{}
@@ -499,16 +541,18 @@ func NewGamepad(ctx context.Context, deps resource.Dependencies, name resource.N
 	}
 
 	arc := &armRemoteControlGamepad{
-		Named:           name.AsNamed(),
-		arm:             arm1,
-		inputController: controller,
-		logger:          logger,
-		cfg:             conf,
-		cancelCtx:       cancelCtx,
-		cancelFunc:      cancelFunc,
-		stepSize:        stepSize,
-		movementStop:    make(chan struct{}),
-		connected:       true,
+		Named:               name.AsNamed(),
+		arm:                 arm1,
+		inputController:     controller,
+		logger:              logger,
+		cfg:                 conf,
+		cancelCtx:           cancelCtx,
+		cancelFunc:          cancelFunc,
+		stepSize:            stepSize,
+		requireEnable:       resolveRequireEnable(conf),
+		maxContinuousMotion: resolveMaxContinuousMotion(conf),
+		movementStop:        make(chan struct{}),
+		connected:           true,
 	}
 
 	mv, err := newMover(ctx, deps, conf, arm1, logger, cancelCtx, &arc.activeBackgroundWorkers)
