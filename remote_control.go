@@ -503,6 +503,10 @@ type armRemoteControlGamepad struct {
 	initialized bool
 	stepSize    float64
 
+	// requireEnable and maxContinuousMotion are resolved once from config in
+	// NewGamepad and never written again, so tick reads them lock-free even
+	// though they sit in this mu-guarded block. Do not add a field here that
+	// is written after construction without also giving it mu protection.
 	requireEnable       bool
 	maxContinuousMotion time.Duration
 
@@ -529,7 +533,7 @@ type armRemoteControlGamepad struct {
 	connected bool
 
 	// motionSince is the start of the current unbroken run of commanded
-	// motion, zero when idle.
+	// motion, zero when idle. Loop-owned; see the dead-operator timer.
 	motionSince time.Time
 
 	activeBackgroundWorkers sync.WaitGroup
@@ -709,10 +713,12 @@ func (arc *armRemoteControlGamepad) continuousMovementProcessor() {
 }
 
 // tick resolves one poll of controller state into the actions it implies. It
-// computes this tick's delta from whichever buttons and hat axes are held,
-// and passes it to mover.step. It never accumulates a target across ticks --
-// each call is a one-shot relative delta -- which is what lets releasing a
-// control stop the arm.
+// runs a sequence of gates (controller-gone, deadman, ...) that can each
+// short-circuit the tick before any delta is computed, then -- if nothing
+// gated -- computes this tick's delta from whichever buttons and hat axes
+// are held and passes it to mover.step. It never accumulates a target across
+// ticks -- each call is a one-shot relative delta -- which is what lets
+// releasing a control stop the arm.
 //
 // It is separated from the loop above so that tests can drive it
 // synchronously with canned events and a controlled clock, rather than
@@ -740,6 +746,11 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		return
 	}
 
+	// Gates, most authoritative first (see SPEC "Gating order"): controller
+	// gone, then deadman. Insert new gates by authority, not convenience --
+	// Task 6's E-stop outranks the deadman and belongs ABOVE this block;
+	// Task 7's dead-operator timer is subordinate to it and belongs
+	// immediately BELOW.
 	if arc.requireEnable && !buttonPressed(events, input.ButtonLT) {
 		arc.haltMotion(ctx)
 		return
@@ -750,7 +761,8 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	dz := arc.zAxis(events) * arc.stepSize
 
 	if dx == 0 && dy == 0 && dz == 0 {
-		// An idle tick ends the run of commanded motion.
+		// An idle tick ends the run. See the spec: the timer exists to catch
+		// a controller that went away, not an operator who paused.
 		arc.motionSince = time.Time{}
 		return
 	}
@@ -774,6 +786,23 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 // keeps a released deadman from calling mover.stop on every subsequent tick,
 // which matters because in teleop mode stop tears down and re-establishes the
 // whole motion-service pipeline.
+//
+// This is meant to be the one chokepoint for "stop, and remember we
+// stopped": every loop-side stop -- the deadman gate above, Task 6's E-stop,
+// Task 7's dead-operator timer -- should route through here rather than
+// calling arc.mover.stop directly. The controller-disconnect branch earlier
+// in tick is a known, scheduled-for-cleanup exception (Task 6), not a
+// pattern to copy, and neither is Close's teardown call.
+//
+// haltMotion is movement-goroutine-only: it writes motionSince, which is
+// unguarded loop-owned state (see the field comment), with no mutex. Do not
+// call it from DoCommand or any other goroutine. The spec anticipates
+// exposing the E-stop over DoCommand; wiring that straight into haltMotion
+// would look like the obvious move -- this is the designated stop path --
+// but it would race motionSince against the movement loop and could call
+// mover.stop concurrently with a step already in flight. An RPC-triggered
+// stop needs to set a loop-owned flag for tick itself to notice and act on,
+// not call this helper directly.
 func (arc *armRemoteControlGamepad) haltMotion(ctx context.Context) {
 	if arc.motionSince.IsZero() {
 		return

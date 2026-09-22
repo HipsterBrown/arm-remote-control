@@ -776,6 +776,12 @@ func TestDeadmanBlocksMotionWhenNotHeld(t *testing.T) {
 	if len(mv.steps()) != 0 {
 		t.Fatalf("expected no motion without the deadman held, got %v", mv.steps())
 	}
+	// The production cold-start case: service up, operator hasn't touched
+	// the pad yet. That must not call mover.stop either -- nothing was ever
+	// moving, so there is nothing to stop.
+	if mv.stops() != 0 {
+		t.Fatalf("expected no stop call when motion was never in flight, got %d", mv.stops())
+	}
 }
 
 func TestDeadmanAllowsMotionWhenHeld(t *testing.T) {
@@ -812,6 +818,14 @@ func TestDeadmanReleaseStopsExactlyOnce(t *testing.T) {
 
 	if mv.stops() != 1 {
 		t.Fatalf("expected exactly 1 stop across three released ticks, got %d", mv.stops())
+	}
+
+	// Re-arm: the gate must not latch off. A re-press after a release has to
+	// resume motion, not stay stopped forever.
+	arc.tick(context.Background(), held, time.Now())
+
+	if len(mv.steps()) != 2 {
+		t.Fatalf("expected motion to resume after re-pressing the deadman, got %d steps", len(mv.steps()))
 	}
 }
 
