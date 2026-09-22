@@ -905,6 +905,14 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 			now.Sub(arc.lastEventChangeAt),
 		)
 		arc.haltMotion(ctx)
+		// The timer is the other half of the vanished-controller fault: the
+		// disconnect gate above catches a pad that emits Disconnect, this one
+		// catches a pad that just goes silent. Same reasoning, same guard --
+		// see the deadman gate's comment above for why gripperBusy is
+		// required here too.
+		if arc.gripperBusy.Load() {
+			arc.stopGripper(ctx)
+		}
 		return
 	}
 

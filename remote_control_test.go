@@ -1463,6 +1463,42 @@ func TestGripperControlsAreNoOpsWhenUnconfigured(t *testing.T) {
 	// Reaching here without a nil-pointer panic is the assertion.
 }
 
+// TestDeadOperatorTimerStopsTheGripper pins the same property as
+// TestDeadmanReleaseStopsTheGripper, TestDisconnectStopsTheGripper, and
+// TestEStopStopsTheGripper, for the fourth call site: the dead-operator
+// timer catches the half of the vanished-controller fault that Disconnect
+// doesn't -- a pad that goes silent instead of emitting Disconnect -- and
+// must not leave a Grab in flight when it trips.
+func TestDeadOperatorTimerStopsTheGripper(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	frozen := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonSouth:   {Event: input.ButtonPress, Time: start},
+	}
+
+	arc.tick(context.Background(), frozen, start)
+
+	// The controller goes silent while the grab is still in flight (fg
+	// blocks). Tick with the same frozen event timestamps until the timer
+	// trips -- one tick past maxContinuousMotion is enough since nothing
+	// here advances lastEventChangeAt.
+	arc.tick(context.Background(), frozen, start.Add(2*time.Second))
+
+	if _, _, stop := fg.counts(); stop != 1 {
+		t.Fatalf("expected the dead-operator timer to stop an in-flight gripper operation, got %d Stop calls", stop)
+	}
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
+}
+
 // TestGripperDispatchGatedByDeadOperatorTimer pins the other load-bearing
 // boundary on the gripper dispatch call in tick: it must sit BELOW the
 // dead-operator timer gate, not above it. Above it, a frozen controller
