@@ -464,8 +464,8 @@ type armRemoteControlGamepad struct {
 	movementTicker *time.Ticker
 	movementStop   chan struct{}
 
-	// Loop-owned state. Touched only by continuousMovementProcessor and the
-	// tick it calls, so it needs no lock.
+	// Loop-owned state. Written only by tick, which runs solely on the
+	// movement goroutine, so it needs no lock.
 	connected bool
 
 	activeBackgroundWorkers sync.WaitGroup
@@ -582,11 +582,8 @@ func controllerGone(events map[input.Control]input.Event) bool {
 	return false
 }
 
-// continuousMovementProcessor is the movement loop. At 10Hz it reads the
-// controller's current state, computes this tick's delta from whichever
-// buttons and hat axes are held, and passes it to mover.step. It never
-// accumulates a target across ticks -- each call is a one-shot relative delta
-// -- which is what lets releasing a control stop the arm.
+// continuousMovementProcessor is the movement loop: it drives a 10Hz ticker,
+// reads the controller's current state each tick, and delegates to tick.
 //
 // Input is read by polling Events() rather than by registering callbacks.
 // RegisterControlCallback does not reach a modular input controller:
@@ -618,9 +615,15 @@ func (arc *armRemoteControlGamepad) continuousMovementProcessor() {
 	}
 }
 
-// tick resolves one poll of controller state into at most one action. It is
-// separated from the loop above so that tests can drive it synchronously with
-// canned events and a controlled clock, rather than through a real ticker.
+// tick resolves one poll of controller state into the actions it implies. It
+// computes this tick's delta from whichever buttons and hat axes are held,
+// and passes it to mover.step. It never accumulates a target across ticks --
+// each call is a one-shot relative delta -- which is what lets releasing a
+// control stop the arm.
+//
+// It is separated from the loop above so that tests can drive it
+// synchronously with canned events and a controlled clock, rather than
+// through a real ticker.
 func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.Control]input.Event, now time.Time) {
 	if controllerGone(events) {
 		if arc.connected {

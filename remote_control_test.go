@@ -685,4 +685,14 @@ func TestTickStopsOnceOnDisconnect(t *testing.T) {
 	if mv.stops() != 1 {
 		t.Fatalf("expected exactly 1 stop call across two disconnected ticks, got %d", mv.stops())
 	}
+
+	// A normal tick means the controller is back, which re-arms the latch:
+	// the next disconnect must stop the mover again, not be swallowed by the
+	// earlier one.
+	arc.tick(context.Background(), map[input.Control]input.Event{}, time.Now())
+	arc.tick(context.Background(), gone, time.Now())
+
+	if mv.stops() != 2 {
+		t.Fatalf("expected the latch to re-arm after reconnecting, got %d stop calls", mv.stops())
+	}
 }
