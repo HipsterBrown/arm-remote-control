@@ -464,6 +464,10 @@ type armRemoteControlGamepad struct {
 	movementTicker *time.Ticker
 	movementStop   chan struct{}
 
+	// Loop-owned state. Touched only by continuousMovementProcessor and the
+	// tick it calls, so it needs no lock.
+	connected bool
+
 	activeBackgroundWorkers sync.WaitGroup
 }
 
@@ -504,6 +508,7 @@ func NewGamepad(ctx context.Context, deps resource.Dependencies, name resource.N
 		cancelFunc:      cancelFunc,
 		stepSize:        stepSize,
 		movementStop:    make(chan struct{}),
+		connected:       true,
 	}
 
 	mv, err := newMover(ctx, deps, conf, arm1, logger, cancelCtx, &arc.activeBackgroundWorkers)
@@ -557,7 +562,7 @@ func axisValue(events map[input.Control]input.Event, c input.Control) float64 {
 	return e.Value
 }
 
-// buttonPressed reports whether a button's most recent event was a press.
+// buttonPressed reports whether a button is currently down.
 // ButtonHold counts: gamepad_linux.go maps evdev autorepeat (value 2) to
 // ButtonHold, so on a pad that autorepeats, a genuinely held button would
 // otherwise read as released.
@@ -594,7 +599,6 @@ func (arc *armRemoteControlGamepad) continuousMovementProcessor() {
 	ticker := time.NewTicker(100 * time.Millisecond) // 10Hz movement updates
 	defer ticker.Stop()
 
-	connected := true
 	for {
 		select {
 		case <-arc.cancelCtx.Done():
@@ -604,70 +608,78 @@ func (arc *armRemoteControlGamepad) continuousMovementProcessor() {
 		case <-ticker.C:
 			events, err := arc.inputController.Events(arc.cancelCtx, nil)
 			if err != nil {
+				// No command is sent this tick, which is the safe outcome:
+				// a controller we cannot read is one we do not obey.
 				arc.logger.Debugw("unable to read input controller events", "error", err)
 				continue
 			}
+			arc.tick(arc.cancelCtx, events, time.Now())
+		}
+	}
+}
 
-			if controllerGone(events) {
-				if connected {
-					connected = false
-					arc.logger.Info("input controller disconnected, stopping arm")
-					// mover.stop, not arm.Stop directly: the teleop mover must
-					// also tear down its pipeline, and teleop_stop alone does
-					// not halt the arm.
-					if err := arc.mover.stop(arc.cancelCtx); err != nil {
-						arc.logger.Errorw("failed to stop on controller disconnect", "error", err)
-					}
-				}
-				continue
-			}
-			connected = true
-
-			arc.mu.RLock()
-			initialized := arc.initialized
-			arc.mu.RUnlock()
-			if !initialized {
-				continue
-			}
-
-			rtPressed := buttonPressed(events, input.ButtonRT)
-			ltPressed := buttonPressed(events, input.ButtonLT)
-			hat0X := axisValue(events, input.AbsoluteHat0X)
-			hat0Y := axisValue(events, input.AbsoluteHat0Y)
-
-			var dx, dy, dz float64
-
-			// Z-axis movement from buttons
-			if rtPressed {
-				dz += arc.stepSize
-			}
-			if ltPressed {
-				dz -= arc.stepSize
-			}
-
-			// X-axis movement from hat
-			if hat0X != 0.0 {
-				dx = hat0X * arc.stepSize
-			}
-
-			// Y-axis movement from hat
-			if hat0Y != 0.0 {
-				dy = hat0Y * arc.stepSize
-			}
-
-			if dx == 0 && dy == 0 && dz == 0 {
-				continue
-			}
-
-			stepCtx, cancel := context.WithTimeout(arc.cancelCtx, 5*time.Second)
-			err = arc.mover.step(stepCtx, dx, dy, dz)
-			cancel()
-			if err != nil {
-				arc.logger.Errorw("failed to apply movement step", "error", err, "dx", dx, "dy", dy, "dz", dz)
-			} else {
-				arc.logger.Debugf("Applied movement step: dx=%f dy=%f dz=%f", dx, dy, dz)
+// tick resolves one poll of controller state into at most one action. It is
+// separated from the loop above so that tests can drive it synchronously with
+// canned events and a controlled clock, rather than through a real ticker.
+func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.Control]input.Event, now time.Time) {
+	if controllerGone(events) {
+		if arc.connected {
+			arc.connected = false
+			arc.logger.Info("input controller disconnected, stopping arm")
+			// mover.stop, not arm.Stop directly: the teleop mover must also
+			// tear down its pipeline, and teleop_stop alone does not halt
+			// the arm.
+			if err := arc.mover.stop(ctx); err != nil {
+				arc.logger.Errorw("failed to stop on controller disconnect", "error", err)
 			}
 		}
+		return
+	}
+	arc.connected = true
+
+	arc.mu.RLock()
+	initialized := arc.initialized
+	arc.mu.RUnlock()
+	if !initialized {
+		return
+	}
+
+	rtPressed := buttonPressed(events, input.ButtonRT)
+	ltPressed := buttonPressed(events, input.ButtonLT)
+	hat0X := axisValue(events, input.AbsoluteHat0X)
+	hat0Y := axisValue(events, input.AbsoluteHat0Y)
+
+	var dx, dy, dz float64
+
+	// Z-axis movement from buttons
+	if rtPressed {
+		dz += arc.stepSize
+	}
+	if ltPressed {
+		dz -= arc.stepSize
+	}
+
+	// X-axis movement from hat
+	if hat0X != 0.0 {
+		dx = hat0X * arc.stepSize
+	}
+
+	// Y-axis movement from hat
+	if hat0Y != 0.0 {
+		dy = hat0Y * arc.stepSize
+	}
+
+	if dx == 0 && dy == 0 && dz == 0 {
+		return
+	}
+
+	stepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := arc.mover.step(stepCtx, dx, dy, dz)
+	cancel()
+	if err != nil {
+		arc.logger.Errorw("failed to apply movement step", "error", err, "dx", dx, "dy", dy, "dz", dz)
+	} else {
+		arc.logger.Debugf("Applied movement step: dx=%f dy=%f dz=%f", dx, dy, dz)
 	}
 }
 

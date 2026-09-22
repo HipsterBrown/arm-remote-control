@@ -592,3 +592,97 @@ func TestButtonPressedAcceptsHold(t *testing.T) {
 		t.Fatalf("expected an absent control not to count as pressed")
 	}
 }
+
+// fakeMover records what the tick logic asked for, standing in for either
+// real mover.
+type fakeMover struct {
+	mu        sync.Mutex
+	stepCalls [][3]float64
+	stopCalls int
+}
+
+func (f *fakeMover) step(ctx context.Context, dx, dy, dz float64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stepCalls = append(f.stepCalls, [3]float64{dx, dy, dz})
+	return nil
+}
+
+func (f *fakeMover) stop(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopCalls++
+	return nil
+}
+
+func (f *fakeMover) steps() [][3]float64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][3]float64, len(f.stepCalls))
+	copy(out, f.stepCalls)
+	return out
+}
+
+func (f *fakeMover) stops() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stopCalls
+}
+
+// newTestGamepad builds a service wired to fakes, bypassing NewGamepad so
+// tests can drive tick directly without a running goroutine.
+func newTestGamepad(t *testing.T, mv mover) *armRemoteControlGamepad {
+	t.Helper()
+	return &armRemoteControlGamepad{
+		mover:       mv,
+		logger:      newTestLogger(t),
+		stepSize:    10.0,
+		initialized: true,
+		connected:   true,
+		cancelCtx:   context.Background(),
+	}
+}
+
+func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonRT:      {Event: input.ButtonPress},
+	}, time.Now())
+
+	steps := mv.steps()
+	if len(steps) != 1 {
+		t.Fatalf("expected 1 step call, got %d", len(steps))
+	}
+	if steps[0] != [3]float64{10, 0, 10} {
+		t.Fatalf("expected delta (10,0,10), got %v", steps[0])
+	}
+}
+
+func TestTickIsANoOpWhenNothingIsHeld(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{}, time.Now())
+
+	if len(mv.steps()) != 0 {
+		t.Fatalf("expected no step calls, got %d", len(mv.steps()))
+	}
+}
+
+func TestTickStopsOnceOnDisconnect(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	gone := map[input.Control]input.Event{
+		input.ButtonSouth: {Event: input.Disconnect},
+	}
+	arc.tick(context.Background(), gone, time.Now())
+	arc.tick(context.Background(), gone, time.Now())
+
+	if mv.stops() != 1 {
+		t.Fatalf("expected exactly 1 stop call across two disconnected ticks, got %d", mv.stops())
+	}
+}
