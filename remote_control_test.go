@@ -7,11 +7,14 @@ import (
 	"time"
 
 	"github.com/golang/geo/r3"
+	"github.com/pkg/errors"
 	commonpb "go.viam.com/api/common/v1"
 	motionpb "go.viam.com/api/service/motion/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"go.viam.com/rdk/components/arm"
+	"go.viam.com/rdk/components/gripper"
+	"go.viam.com/rdk/components/input"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/motion"
@@ -568,5 +571,973 @@ func TestProbeRespectsContextCancellation(t *testing.T) {
 	err := tm.probe(ctx)
 	if err == nil {
 		t.Fatal("expected probe to return an error when its context is cancelled")
+	}
+}
+
+func TestButtonPressedAcceptsHold(t *testing.T) {
+	events := map[input.Control]input.Event{
+		input.ButtonSouth: {Event: input.ButtonPress, Control: input.ButtonSouth},
+		input.ButtonEast:  {Event: input.ButtonHold, Control: input.ButtonEast},
+		input.ButtonWest:  {Event: input.ButtonRelease, Control: input.ButtonWest},
+	}
+
+	if !buttonPressed(events, input.ButtonSouth) {
+		t.Fatalf("expected ButtonPress to count as pressed")
+	}
+	if !buttonPressed(events, input.ButtonEast) {
+		t.Fatalf("expected ButtonHold to count as pressed")
+	}
+	if buttonPressed(events, input.ButtonWest) {
+		t.Fatalf("expected ButtonRelease not to count as pressed")
+	}
+	if buttonPressed(events, input.ButtonNorth) {
+		t.Fatalf("expected an absent control not to count as pressed")
+	}
+}
+
+// fakeMover records what the tick logic asked for, standing in for either
+// real mover.
+type fakeMover struct {
+	mu        sync.Mutex
+	stepCalls [][3]float64
+	stopCalls int
+}
+
+func (f *fakeMover) step(ctx context.Context, dx, dy, dz float64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stepCalls = append(f.stepCalls, [3]float64{dx, dy, dz})
+	return nil
+}
+
+func (f *fakeMover) stop(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopCalls++
+	return nil
+}
+
+func (f *fakeMover) steps() [][3]float64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][3]float64, len(f.stepCalls))
+	copy(out, f.stepCalls)
+	return out
+}
+
+func (f *fakeMover) stops() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stopCalls
+}
+
+// newTestGamepad builds a service wired to fakes, bypassing NewGamepad so
+// tests can drive tick directly without a running goroutine.
+//
+// maxContinuousMotion is deliberately left at its zero value, which disables
+// the dead-operator timer: most tests have nothing to do with it, and a
+// default-on timer measured against wall-clock time would make them flaky.
+// Tests that exercise the timer opt in explicitly via arc.maxContinuousMotion.
+func newTestGamepad(t *testing.T, mv mover) *armRemoteControlGamepad {
+	t.Helper()
+	return &armRemoteControlGamepad{
+		mover:          mv,
+		logger:         newTestLogger(t),
+		stepSize:       10.0,
+		initialized:    true,
+		connected:      true,
+		analogTriggers: true,
+		requireEnable:  true,
+		cancelCtx:      context.Background(),
+	}
+}
+
+func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteRZ:    {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	steps := mv.steps()
+	if len(steps) != 1 {
+		t.Fatalf("expected 1 step call, got %d", len(steps))
+	}
+	if steps[0] != [3]float64{10, 0, 10} {
+		t.Fatalf("expected delta (10,0,10), got %v", steps[0])
+	}
+}
+
+func TestZComesFromAnalogTriggers(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
+		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	steps := mv.steps()
+	if len(steps) != 1 || steps[0][2] != 10.0 {
+		t.Fatalf("expected dz=10 from a fully pressed right trigger, got %v", steps)
+	}
+}
+
+func TestOpposedTriggersCancel(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
+		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteZ:  {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 0 {
+		t.Fatalf("expected both triggers pressed to cancel to no motion, got %v", mv.steps())
+	}
+}
+
+func TestTriggersAreProportional(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
+		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 0.5},
+	}, time.Now())
+
+	if steps := mv.steps(); len(steps) != 1 || steps[0][2] != 5.0 {
+		t.Fatalf("expected dz=5 at half deflection, got %v", steps)
+	}
+}
+
+// fakeController satisfies input.Controller. Only Controls is exercised --
+// tick takes its events as an argument, so nothing else is needed.
+type fakeController struct {
+	input.Controller
+
+	controls []input.Control
+	err      error
+}
+
+func (f *fakeController) Controls(ctx context.Context, extra map[string]interface{}) ([]input.Control, error) {
+	return f.controls, f.err
+}
+
+func TestHasAnalogTriggersDetection(t *testing.T) {
+	logger := newTestLogger(t)
+	ctx := context.Background()
+
+	full := &fakeController{controls: []input.Control{input.AbsoluteX, input.AbsoluteZ, input.AbsoluteRZ}}
+	if !hasAnalogTriggers(ctx, full, logger) {
+		t.Fatalf("expected a pad reporting both trigger axes to use the analog path")
+	}
+
+	// The Nintendo/8BitDo "Pro Controller" S-input shape: triggers are
+	// digital buttons, no trigger axes at all.
+	digital := &fakeController{controls: []input.Control{input.AbsoluteX, input.ButtonLT2, input.ButtonRT2}}
+	if hasAnalogTriggers(ctx, digital, logger) {
+		t.Fatalf("expected a pad without trigger axes to fall back to the digital triggers")
+	}
+
+	partial := &fakeController{controls: []input.Control{input.AbsoluteZ}}
+	if hasAnalogTriggers(ctx, partial, logger) {
+		t.Fatalf("expected a pad reporting only one trigger axis to fall back")
+	}
+
+	// A transient RPC failure is not evidence of an odd pad; assume analog.
+	broken := &fakeController{err: errors.New("boom")}
+	if !hasAnalogTriggers(ctx, broken, logger) {
+		t.Fatalf("expected a Controls error to assume analog triggers")
+	}
+}
+
+func TestZFallsBackToDigitalTriggers(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = false // pad reports no AbsoluteZ/AbsoluteRZ
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.ButtonRT2: {Event: input.ButtonPress},
+	}, time.Now())
+
+	if steps := mv.steps(); len(steps) != 1 || steps[0][2] != 10.0 {
+		t.Fatalf("expected dz=10 from the digital right trigger, got %v", steps)
+	}
+}
+
+func TestDeadmanBlocksMotionWhenNotHeld(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 0 {
+		t.Fatalf("expected no motion without the deadman held, got %v", mv.steps())
+	}
+	// The production cold-start case: service up, operator hasn't touched
+	// the pad yet. That must not call mover.stop either -- nothing was ever
+	// moving, so there is nothing to stop.
+	if mv.stops() != 0 {
+		t.Fatalf("expected no stop call when motion was never in flight, got %d", mv.stops())
+	}
+}
+
+func TestDeadmanAllowsMotionWhenHeld(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected 1 step with the deadman held, got %v", mv.steps())
+	}
+}
+
+func TestDeadmanReleaseStopsExactlyOnce(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	held := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+	released := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonRelease},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+
+	arc.tick(context.Background(), held, time.Now())
+	arc.tick(context.Background(), released, time.Now())
+	arc.tick(context.Background(), released, time.Now())
+	arc.tick(context.Background(), released, time.Now())
+
+	if mv.stops() != 1 {
+		t.Fatalf("expected exactly 1 stop across three released ticks, got %d", mv.stops())
+	}
+
+	// Re-arm: the gate must not latch off. A re-press after a release has to
+	// resume motion, not stay stopped forever.
+	arc.tick(context.Background(), held, time.Now())
+
+	if len(mv.steps()) != 2 {
+		t.Fatalf("expected motion to resume after re-pressing the deadman, got %d steps", len(mv.steps()))
+	}
+}
+
+// TestDeadmanReleaseStopsAfterAnIdleTick pins the human-realistic release
+// sequence: centre the stick first, then let go of the deadman. That is how
+// an operator actually stops -- not the single combined transition
+// TestDeadmanReleaseStopsExactlyOnce drives. The intervening idle tick (stick
+// centred, deadman still held) must not defeat the eventual stop.
+func TestDeadmanReleaseStopsAfterAnIdleTick(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	moving := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+	idle := map[input.Control]input.Event{
+		input.ButtonLT: {Event: input.ButtonHold},
+	}
+	released := map[input.Control]input.Event{
+		input.ButtonLT: {Event: input.ButtonRelease},
+	}
+
+	arc.tick(context.Background(), moving, time.Now())
+	arc.tick(context.Background(), idle, time.Now())
+	arc.tick(context.Background(), released, time.Now())
+
+	if mv.stops() != 1 {
+		t.Fatalf("expected the deadman release to stop the arm even after an idle tick cleared motionSince, got %d stops", mv.stops())
+	}
+}
+
+func TestDeadmanCanBeDisabled(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.requireEnable = false
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion without the deadman when require_enable is false, got %v", mv.steps())
+	}
+}
+
+func TestTickIsANoOpWhenNothingIsHeld(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{}, time.Now())
+
+	if len(mv.steps()) != 0 {
+		t.Fatalf("expected no step calls, got %d", len(mv.steps()))
+	}
+}
+
+func TestTickStopsOnceOnDisconnect(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	gone := map[input.Control]input.Event{
+		input.ButtonSouth: {Event: input.Disconnect},
+	}
+	arc.tick(context.Background(), gone, time.Now())
+	arc.tick(context.Background(), gone, time.Now())
+
+	if mv.stops() != 1 {
+		t.Fatalf("expected exactly 1 stop call across two disconnected ticks, got %d", mv.stops())
+	}
+
+	// A normal tick means the controller is back, which re-arms the latch:
+	// the next disconnect must stop the mover again, not be swallowed by the
+	// earlier one.
+	arc.tick(context.Background(), map[input.Control]input.Event{}, time.Now())
+	arc.tick(context.Background(), gone, time.Now())
+
+	if mv.stops() != 2 {
+		t.Fatalf("expected the latch to re-arm after reconnecting, got %d stop calls", mv.stops())
+	}
+}
+
+func TestOmittedSafetyFieldsDefaultSafe(t *testing.T) {
+	conf := &Config{ArmName: "arm-1", InputControllerName: "gamepad-1"}
+
+	if got := resolveRequireEnable(conf); !got {
+		t.Fatalf("expected an omitted require_enable to default to true (deadman enabled), got false")
+	}
+	if got := resolveMaxContinuousMotion(conf); got != defaultMaxContinuousMotion {
+		t.Fatalf("expected an omitted max_continuous_motion to default to %v, got %v", defaultMaxContinuousMotion, got)
+	}
+}
+
+func TestExplicitSafetyFieldsAreHonoured(t *testing.T) {
+	no := false
+	zero := 0
+	conf := &Config{RequireEnable: &no, MaxContinuousMotion: &zero}
+
+	if resolveRequireEnable(conf) {
+		t.Fatalf("expected an explicit require_enable:false to disable the deadman")
+	}
+	if got := resolveMaxContinuousMotion(conf); got != 0 {
+		t.Fatalf("expected an explicit max_continuous_motion:0 to disable the timer, got %v", got)
+	}
+}
+
+func TestValidateAddsGripperDependencyWhenSet(t *testing.T) {
+	deps, _, err := (&Config{
+		ArmName:             "arm-1",
+		InputControllerName: "gamepad-1",
+		Gripper:             "gripper-1",
+	}).Validate("components.0")
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	var found bool
+	for _, d := range deps {
+		if d == "gripper-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected gripper-1 in deps, got %v", deps)
+	}
+}
+
+func TestValidateOmitsGripperDependencyWhenUnset(t *testing.T) {
+	deps, _, err := (&Config{ArmName: "arm-1", InputControllerName: "gamepad-1"}).Validate("components.0")
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if len(deps) != 2 {
+		t.Fatalf("expected exactly the arm and controller deps, got %v", deps)
+	}
+}
+
+func TestValidateRejectsNegativeMaxContinuousMotion(t *testing.T) {
+	negative := -5
+	_, _, err := (&Config{
+		ArmName:             "arm-1",
+		InputControllerName: "gamepad-1",
+		MaxContinuousMotion: &negative,
+	}).Validate("components.0")
+	if err == nil {
+		t.Fatalf("expected a negative max_continuous_motion to fail validation")
+	}
+}
+
+func TestValidateAcceptsZeroMaxContinuousMotion(t *testing.T) {
+	zero := 0
+	_, _, err := (&Config{
+		ArmName:             "arm-1",
+		InputControllerName: "gamepad-1",
+		MaxContinuousMotion: &zero,
+	}).Validate("components.0")
+	if err != nil {
+		t.Fatalf("expected max_continuous_motion:0 (timer disabled) to be valid, got: %v", err)
+	}
+}
+
+func TestEStopLatchesAndBlocksMotion(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	moving := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+
+	arc.tick(context.Background(), moving, time.Now())
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion before the E-stop, got %v", mv.steps())
+	}
+
+	estop := map[input.Control]input.Event{
+		input.ButtonMenu: {Event: input.ButtonPress},
+	}
+	// Hold the E-stop down for several ticks, as an operator's thumb would.
+	// It must stop the mover on the latching transition only, not on every
+	// tick the button stays held.
+	for i := 0; i < 5; i++ {
+		arc.tick(context.Background(), estop, time.Now())
+	}
+	if mv.stops() != 1 {
+		t.Fatalf("expected the E-stop to stop the mover exactly once across 5 held ticks, got %d stops", mv.stops())
+	}
+
+	// Button released, but the latch holds.
+	arc.tick(context.Background(), moving, time.Now())
+	arc.tick(context.Background(), moving, time.Now())
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected no further motion while latched, got %v", mv.steps())
+	}
+}
+
+func TestEStopClearsOnStart(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.estopped = true
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonStart: {Event: input.ButtonPress},
+	}, time.Now())
+
+	moving := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+	arc.tick(context.Background(), moving, time.Now())
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion to resume after ButtonStart cleared the latch, got %v", mv.steps())
+	}
+}
+
+func TestEStopButtonAlsoLatches(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonEStop: {Event: input.ButtonPress},
+	}, time.Now())
+
+	if !arc.estopped {
+		t.Fatalf("expected input.ButtonEStop to latch the E-stop")
+	}
+}
+
+func TestDeadOperatorTimerStopsFrozenController(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	frozen := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+	}
+
+	arc.tick(context.Background(), frozen, start)
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion at the start, got %v", mv.steps())
+	}
+
+	// The controller then goes silent for good: four more ticks pass with
+	// the same frozen events (five in total). A regression that clears
+	// motionSince inside the timer gate re-arms the delta path on every tick
+	// after the gate first fires -- each stop immediately followed by
+	// another step, a sawtooth -- which a run of only two ticks (as this
+	// test used to be) cannot catch: the sawtooth's second step doesn't
+	// land until the third tick, so steps==1/stops==1 holds either way at
+	// two ticks.
+	for i := 2; i <= 5; i++ {
+		arc.tick(context.Background(), frozen, start.Add(time.Duration(i)*time.Second))
+	}
+
+	if len(mv.steps()) != 1 || mv.stops() != 1 {
+		t.Fatalf("expected the timer to latch after firing once, not sawtooth: got %d steps, %d stops", len(mv.steps()), mv.stops())
+	}
+
+	// The spec says motion resumes only once lastEventAt advances. Nothing
+	// above proves the gate ever un-latches -- it deliberately never clears
+	// its own trip condition -- so pin that a tick with genuinely fresh
+	// event timestamps lets motion through again.
+	recovered := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start.Add(10 * time.Second)},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(10 * time.Second)},
+	}
+	arc.tick(context.Background(), recovered, start.Add(10*time.Second))
+
+	if len(mv.steps()) != 2 {
+		t.Fatalf("expected motion to resume once lastEventAt advances, got %d steps", len(mv.steps()))
+	}
+}
+
+func TestDeadOperatorTimerResetsOnFreshEvents(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		at := start.Add(time.Duration(i) * 500 * time.Millisecond)
+		arc.tick(context.Background(), map[input.Control]input.Event{
+			input.ButtonLT:      {Event: input.ButtonPress, Time: at},
+			input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: at},
+		}, at)
+	}
+
+	if len(mv.steps()) != 5 {
+		t.Fatalf("expected all 5 ticks to move while events keep advancing, got %v", mv.steps())
+	}
+}
+
+func TestIdleTicksClearTheRunTimer(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	// Event timestamps advance with each tick. This matters: a real operator
+	// centring a stick emits a fresh event, so lastEventAt advances and the
+	// dead-operator timer never trips. A fixture that freezes Time at `start`
+	// instead simulates a *dead controller*, which correctly DOES trip the
+	// timer -- and would make this test fail for the right reason about the
+	// wrong scenario. Do not "fix" such a failure by making haltMotion clear
+	// motionSince; that re-conflates the run timer with the stop latch and
+	// reintroduces the sawtooth documented in the spec.
+	at := func(d time.Duration) time.Time { return start.Add(d) }
+	moving := func(d time.Duration) map[input.Control]input.Event {
+		return map[input.Control]input.Event{
+			input.ButtonLT:      {Event: input.ButtonPress, Time: at(d)},
+			input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: at(d)},
+		}
+	}
+	resting := func(d time.Duration) map[input.Control]input.Event {
+		return map[input.Control]input.Event{
+			input.ButtonLT: {Event: input.ButtonPress, Time: at(d)},
+		}
+	}
+
+	arc.tick(context.Background(), moving(0), at(0))
+	// Operator rests on the deadman for well over the timeout, but keeps
+	// producing events -- the controller is alive, the hand is just still.
+	arc.tick(context.Background(), resting(2*time.Second), at(2*time.Second))
+	arc.tick(context.Background(), resting(4*time.Second), at(4*time.Second))
+	// ...then moves again. Resting must not have tripped the timer.
+	arc.tick(context.Background(), moving(5*time.Second), at(5*time.Second))
+
+	if len(mv.steps()) != 2 {
+		t.Fatalf("expected resting not to trip the timer; got %v", mv.steps())
+	}
+}
+
+func TestDeadOperatorTimerCanBeDisabled(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.maxContinuousMotion = 0
+
+	start := time.Now()
+	frozen := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+	}
+
+	arc.tick(context.Background(), frozen, start)
+	arc.tick(context.Background(), frozen, start.Add(time.Hour))
+
+	if len(mv.steps()) != 2 {
+		t.Fatalf("expected a disabled timer never to suppress motion, got %v", mv.steps())
+	}
+}
+
+// TestDeadOperatorTimerUsesHostClockNotControllerClock pins the timer to the
+// host's clock (`now`), not the controller's (`Event.Time`). A modular or
+// remote controller's clock can drift from the host's; if the gate compared
+// now against a controller timestamp directly, a controller clock running
+// ahead of the host by more than maxContinuousMotion would make
+// now.Sub(lastEventAt) permanently negative, silently disabling the gate.
+func TestDeadOperatorTimerUsesHostClockNotControllerClock(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	// The controller's own clock reports timestamps an hour ahead of the
+	// host's -- e.g. a modular/remote controller with clock drift.
+	aheadOfHost := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start.Add(time.Hour)},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(time.Hour)},
+	}
+
+	arc.tick(context.Background(), aheadOfHost, start)
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion at the start, got %v", mv.steps())
+	}
+
+	// The host clock advances well past the timeout; the controller's
+	// (unchanged) event timestamps still read far in the future relative to
+	// the host. The gate must still fire, because it is host-clock-only.
+	arc.tick(context.Background(), aheadOfHost, start.Add(2*time.Second))
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected the timer to still suppress motion despite the controller's clock running ahead, got %v", mv.steps())
+	}
+	if mv.stops() != 1 {
+		t.Fatalf("expected the timer to stop the mover once, got %d", mv.stops())
+	}
+}
+
+// fakeGripper satisfies gripper.Gripper. block, when non-nil, holds Grab and
+// Open until closed, standing in for slow hardware.
+type fakeGripper struct {
+	gripper.Gripper
+
+	block chan struct{}
+
+	mu        sync.Mutex
+	grabCalls int
+	openCalls int
+	stopCalls int
+}
+
+func (f *fakeGripper) Grab(ctx context.Context, extra map[string]interface{}) (bool, error) {
+	f.mu.Lock()
+	f.grabCalls++
+	f.mu.Unlock()
+	if f.block != nil {
+		<-f.block
+	}
+	return true, nil
+}
+
+func (f *fakeGripper) Open(ctx context.Context, extra map[string]interface{}) error {
+	f.mu.Lock()
+	f.openCalls++
+	f.mu.Unlock()
+	if f.block != nil {
+		<-f.block
+	}
+	return nil
+}
+
+func (f *fakeGripper) Stop(ctx context.Context, extra map[string]interface{}) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopCalls++
+	return nil
+}
+
+func (f *fakeGripper) counts() (grab, open, stop int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.grabCalls, f.openCalls, f.stopCalls
+}
+
+func TestGripperGrabAndOpen(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+	arc.activeBackgroundWorkers.Wait()
+
+	if grab, _, _ := fg.counts(); grab != 1 {
+		t.Fatalf("expected 1 Grab call, got %d", grab)
+	}
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
+		input.ButtonEast: {Event: input.ButtonPress},
+	}, time.Now())
+	arc.activeBackgroundWorkers.Wait()
+
+	if _, open, _ := fg.counts(); open != 1 {
+		t.Fatalf("expected 1 Open call, got %d", open)
+	}
+}
+
+func TestGripperDoesNotBlockTheMovementLoop(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	// Press grab; the fake will not return.
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+
+	// The loop must keep servicing motion while the gripper is stuck.
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion to continue while the gripper blocks, got %v", mv.steps())
+	}
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
+}
+
+func TestConcurrentGripperPressesAreDropped(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	press := map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}
+	arc.tick(context.Background(), press, time.Now())
+	arc.tick(context.Background(), press, time.Now())
+	arc.tick(context.Background(), press, time.Now())
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
+
+	if grab, _, _ := fg.counts(); grab != 1 {
+		t.Fatalf("expected presses during an in-flight op to be dropped, got %d Grab calls", grab)
+	}
+}
+
+func TestEStopStopsTheGripper(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonMenu: {Event: input.ButtonPress},
+	}, time.Now())
+
+	if _, _, stop := fg.counts(); stop != 1 {
+		t.Fatalf("expected the E-stop to stop the gripper, got %d Stop calls", stop)
+	}
+}
+
+// TestDeadmanReleaseStopsTheGripper mirrors TestEStopStopsTheGripper: the
+// deadman must be able to interrupt an in-flight gripper operation, not just
+// arm motion. Without this, releasing the deadman mid-grasp stops the arm
+// but leaves the jaws closing on real hardware -- the operator's hands-off
+// reflex would not actually stop the pinch hazard.
+func TestDeadmanReleaseStopsTheGripper(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+
+	// Deadman released while the grab is still in flight.
+	arc.tick(context.Background(), map[input.Control]input.Event{}, time.Now())
+
+	if _, _, stop := fg.counts(); stop != 1 {
+		t.Fatalf("expected releasing the deadman to stop an in-flight gripper operation, got %d Stop calls", stop)
+	}
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
+}
+
+// TestDisconnectStopsTheGripper mirrors TestEStopStopsTheGripper and
+// TestDeadmanReleaseStopsTheGripper: stopGripper has three call sites (E-stop,
+// deadman release, disconnect), and a controller vanishing mid-grasp must not
+// leave the jaws closing any more than a released deadman or a latched E-stop
+// would.
+func TestDisconnectStopsTheGripper(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+
+	// Controller vanishes while the grab is still in flight.
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonSouth: {Event: input.Disconnect},
+	}, time.Now())
+
+	if _, _, stop := fg.counts(); stop != 1 {
+		t.Fatalf("expected a vanished controller to stop an in-flight gripper operation, got %d Stop calls", stop)
+	}
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
+}
+
+// TestGripperDispatchRequiresTheDeadman pins the gating order structurally
+// documented in tick's comment (see docs/SPEC-teleop-safety-gripper.md
+// "Gating order"): the gripper dispatch sits below the deadman gate and the
+// E-stop latch, so neither a released deadman nor a latched E-stop can reach
+// it. Every other gripper test presses ButtonLT alongside the gripper
+// button, so none of them would catch the dispatch call being moved above
+// either gate -- this is the test that would.
+func TestGripperDispatchRequiresTheDeadman(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	// Deadman not held.
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+	arc.activeBackgroundWorkers.Wait()
+
+	if grab, _, _ := fg.counts(); grab != 0 {
+		t.Fatalf("expected no Grab calls with the deadman released, got %d", grab)
+	}
+
+	// E-stop latched, deadman held.
+	arc.estopped = true
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+	arc.activeBackgroundWorkers.Wait()
+
+	if grab, _, _ := fg.counts(); grab != 0 {
+		t.Fatalf("expected no Grab calls with the E-stop latched, got %d", grab)
+	}
+}
+
+func TestGripperControlsAreNoOpsWhenUnconfigured(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv) // arc.gripper stays nil
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+	// Reaching here without a nil-pointer panic is the assertion.
+}
+
+// TestDeadOperatorTimerStopsTheGripper pins the same property as
+// TestDeadmanReleaseStopsTheGripper, TestDisconnectStopsTheGripper, and
+// TestEStopStopsTheGripper, for the fourth call site: the dead-operator
+// timer catches the half of the vanished-controller fault that Disconnect
+// doesn't -- a pad that goes silent instead of emitting Disconnect -- and
+// must not leave a Grab in flight when it trips.
+func TestDeadOperatorTimerStopsTheGripper(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	frozen := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonSouth:   {Event: input.ButtonPress, Time: start},
+	}
+
+	arc.tick(context.Background(), frozen, start)
+
+	// The controller goes silent while the grab is still in flight (fg
+	// blocks). Tick with the same frozen event timestamps until the timer
+	// trips -- one tick past maxContinuousMotion is enough since nothing
+	// here advances lastEventChangeAt.
+	arc.tick(context.Background(), frozen, start.Add(2*time.Second))
+
+	if _, _, stop := fg.counts(); stop != 1 {
+		t.Fatalf("expected the dead-operator timer to stop an in-flight gripper operation, got %d Stop calls", stop)
+	}
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
+}
+
+// TestGripperDispatchGatedByDeadOperatorTimer pins the other load-bearing
+// boundary on the gripper dispatch call in tick: it must sit BELOW the
+// dead-operator timer gate, not above it. Above it, a frozen controller
+// still holding ButtonSouth re-fires Grab on every tick once gripperBusy
+// clears -- a runaway gripper driven by a dead controller, which is exactly
+// what the timer exists to prevent (see TestDeadOperatorTimerStopsFrozenController
+// for the equivalent motion-only case). Below it, the timer's own trip
+// stops the dispatch along with the arm.
+//
+// The timer needs *strictly greater than* maxContinuousMotion to trip, so
+// one dispatch inside that window is expected before the gate latches -- 2
+// calls, not 1, is correct here, not a bug. This does not claim ButtonSouth
+// is edge-triggered (it isn't: holding it re-fires Grab each time the
+// previous op completes, gripperBusy only bounds one op in flight at a
+// time); it claims the timer gate -- not the button -- is what bounds the
+// pile-up on a frozen controller.
+func TestGripperDispatchGatedByDeadOperatorTimer(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{} // returns immediately: no blocking channel
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	frozen := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonSouth:   {Event: input.ButtonPress, Time: start},
+	}
+
+	for i := 0; i < 11; i++ {
+		arc.tick(context.Background(), frozen, start.Add(time.Duration(i)*time.Second))
+		// Let the dispatched goroutine (if any) finish and release
+		// gripperBusy before the next tick, so the count below is
+		// deterministic rather than racing the background goroutine.
+		arc.activeBackgroundWorkers.Wait()
+	}
+
+	if grab, _, _ := fg.counts(); grab != 2 {
+		t.Fatalf("expected the dead-operator timer to bound gripper dispatch on a frozen controller, got %d Grab calls across 11 ticks", grab)
 	}
 }
