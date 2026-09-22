@@ -635,19 +635,19 @@ func (f *fakeMover) stops() int {
 func newTestGamepad(t *testing.T, mv mover) *armRemoteControlGamepad {
 	t.Helper()
 	return &armRemoteControlGamepad{
-		mover:       mv,
-		logger:      newTestLogger(t),
-		stepSize:    10.0,
-		initialized: true,
-		connected:   true,
-		cancelCtx:   context.Background(),
+		mover:          mv,
+		logger:         newTestLogger(t),
+		stepSize:       10.0,
+		initialized:    true,
+		connected:      true,
+		analogTriggers: true,
+		cancelCtx:      context.Background(),
 	}
 }
 
 func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
 		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
@@ -666,7 +666,6 @@ func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
 func TestZComesFromAnalogTriggers(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
 		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
@@ -681,7 +680,6 @@ func TestZComesFromAnalogTriggers(t *testing.T) {
 func TestOpposedTriggersCancel(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
 		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
@@ -696,7 +694,6 @@ func TestOpposedTriggersCancel(t *testing.T) {
 func TestTriggersAreProportional(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
 		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 0.5},

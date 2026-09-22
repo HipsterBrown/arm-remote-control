@@ -100,7 +100,7 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	}
 
 	if cfg.MaxContinuousMotion != nil && *cfg.MaxContinuousMotion < 0 {
-		return nil, nil, resource.NewConfigValidationError(path, errors.New("max_continuous_motion must not be negative"))
+		return nil, nil, resource.NewConfigValidationError(path, errors.New("max_continuous_motion must not be negative; use 0 to disable the timer"))
 	}
 
 	return deps, nil, nil
@@ -510,6 +510,14 @@ type armRemoteControlGamepad struct {
 	// Several mappings in gamepad_mappings_linux.go do not, exposing their
 	// triggers only as the digital ButtonLT2/ButtonRT2. Resolved once at
 	// construction rather than probed per tick.
+	//
+	// This does not react to a bare USB swap for a different pad model with
+	// no reconfigure (resource.AlwaysRebuild covers a reconfigure, not that).
+	// Both stale directions fail toward no-Z-motion, never runaway: cached
+	// true against a digital-trigger pad means the analog axes are simply
+	// absent from events, so axisValue returns 0; cached false against an
+	// analog pad means the digital trigger buttons it checks are never
+	// pressed. Either way Z stays quiet rather than moving on its own.
 	analogTriggers bool
 
 	// Button state tracking for continuous movement
@@ -728,22 +736,9 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		return
 	}
 
-	hat0X := axisValue(events, input.AbsoluteHat0X)
-	hat0Y := axisValue(events, input.AbsoluteHat0Y)
-
-	var dx, dy float64
-
+	dx := axisValue(events, input.AbsoluteHat0X) * arc.stepSize
+	dy := axisValue(events, input.AbsoluteHat0Y) * arc.stepSize
 	dz := arc.zAxis(events) * arc.stepSize
-
-	// X-axis movement from hat
-	if hat0X != 0.0 {
-		dx = hat0X * arc.stepSize
-	}
-
-	// Y-axis movement from hat
-	if hat0Y != 0.0 {
-		dy = hat0Y * arc.stepSize
-	}
 
 	if dx == 0 && dy == 0 && dz == 0 {
 		return
