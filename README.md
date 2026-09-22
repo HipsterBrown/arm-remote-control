@@ -4,7 +4,7 @@ This module provides remote control functionality for robotic arms using gamepad
 
 ## Model hipsterbrown:arm-remote-control:gamepad
 
-The gamepad model allows you to control a robotic arm using a gamepad controller. It provides continuous movement on all three axes (X, Y, Z) with configurable step sizes, a deadman-gated enable control, a latching emergency stop, an optional gripper, and automatic safety stops when the controller connects, disconnects, or goes silent mid-move.
+The gamepad model allows you to control a robotic arm using a gamepad controller. It provides continuous movement on all three axes (X, Y, Z) with configurable step sizes, a deadman-gated enable control, a latching emergency stop, an optional gripper, and an automatic safety stop when the controller disconnects or goes silent mid-move.
 
 ### Features
 
@@ -14,7 +14,7 @@ The gamepad model allows you to control a robotic arm using a gamepad controller
 - **Latching E-Stop**: One button halts the arm and gripper immediately and holds them stopped until explicitly cleared
 - **Dead-Operator Timer**: Motion stops automatically if the controller stops reporting fresh events mid-move
 - **Gripper Control**: Optional grab/open control, gated by the same deadman as arm motion
-- **Connection Safety**: Automatic arm stop on controller connect/disconnect events
+- **Disconnect Safety**: Automatic arm stop when the controller disconnects
 - **Configurable Speed**: Adjustable step size for movement sensitivity
 
 ### Control Mapping
@@ -25,7 +25,10 @@ The gamepad model allows you to control a robotic arm using a gamepad controller
 | `AbsoluteHat0Y` | Y-axis, forward/back on the D-pad |
 | Right analog trigger (`AbsoluteRZ`) | Z-axis up, proportional |
 | Left analog trigger (`AbsoluteZ`) | Z-axis down, proportional |
+| Digital right trigger (`ButtonRT2`) | Z-axis up (fallback on pads with no analog trigger axes) |
+| Digital left trigger (`ButtonLT2`) | Z-axis down (fallback on pads with no analog trigger axes) |
 | Left bumper (`ButtonLT`) | **Deadman** — hold to enable motion |
+| Right bumper (`ButtonRT`) | Unmapped |
 | `ButtonSouth` | Gripper grab (deadman must be held) |
 | `ButtonEast` | Gripper open (deadman must be held) |
 | `ButtonMenu` / `ButtonEStop` | **E-stop**, latching |
@@ -33,14 +36,18 @@ The gamepad model allows you to control a robotic arm using a gamepad controller
 
 > **Breaking change:** Z-axis control has moved from the bumpers
 > (`ButtonLT`/`ButtonRT`) to the analog triggers, freeing the left bumper for
-> the deadman. On pads that report no analog trigger axes — the Nintendo and
-> 8BitDo "Pro Controller" S-input profile and "USB Gamepad" among them — Z
-> falls back to the digital `ButtonLT2`/`ButtonRT2` triggers automatically.
+> the deadman; the right bumper (`ButtonRT`) is now unmapped. On pads that
+> report no analog trigger axes — the Nintendo and 8BitDo "Pro Controller"
+> S-input profile and "USB Gamepad" among them — Z falls back to the digital
+> `ButtonLT2`/`ButtonRT2` triggers automatically.
 
 > **The arm will not move unless the deadman is held**, and neither will the
 > gripper — the deadman gates all actuation, not just arm motion. Set
 > `require_enable: false` to disable this, accepting that any held control
-> then moves the arm.
+> then moves the arm. With the deadman disabled, the dead-operator timer
+> (`max_continuous_motion`) becomes the primary automatic backstop against a
+> stuck or vanished controller; disabling that too
+> (`max_continuous_motion: 0`) leaves only the manual E-stop.
 
 ### Movement modes
 
@@ -174,9 +181,8 @@ With a gripper and the safety defaults left in place:
   adjust it for your hardware and workflow, and set it to `0` to disable the
   timer entirely.
 - The arm will automatically stop if the gamepad disconnects
-- The arm will stop if the gamepad reconnects (to ensure safe state)
-- In teleop mode, disconnect/reconnect and service `Close()` always tear down
-  the teleop pipeline (`teleop_stop`) *and* call `arm.Stop()`, since
+- In teleop mode, disconnect and service `Close()` always tear down the
+  teleop pipeline (`teleop_stop`) *and* call `arm.Stop()`, since
   `teleop_stop` alone does not stop the arm; expect up to one step of coast
   after a stop
 - In teleop mode, at startup the service sends a zero-delta move through the
