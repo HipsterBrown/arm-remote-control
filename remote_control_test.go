@@ -632,6 +632,11 @@ func (f *fakeMover) stops() int {
 
 // newTestGamepad builds a service wired to fakes, bypassing NewGamepad so
 // tests can drive tick directly without a running goroutine.
+//
+// maxContinuousMotion is deliberately left at its zero value, which disables
+// the dead-operator timer: most tests have nothing to do with it, and a
+// default-on timer measured against wall-clock time would make them flaky.
+// Tests that exercise the timer opt in explicitly via arc.maxContinuousMotion.
 func newTestGamepad(t *testing.T, mv mover) *armRemoteControlGamepad {
 	t.Helper()
 	return &armRemoteControlGamepad{
@@ -1058,7 +1063,6 @@ func TestEStopButtonAlsoLatches(t *testing.T) {
 func TestDeadOperatorTimerStopsFrozenController(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 	arc.maxContinuousMotion = time.Second
 
 	start := time.Now()
@@ -1072,21 +1076,40 @@ func TestDeadOperatorTimerStopsFrozenController(t *testing.T) {
 		t.Fatalf("expected motion at the start, got %v", mv.steps())
 	}
 
-	// Two seconds later the events have not advanced at all.
-	arc.tick(context.Background(), frozen, start.Add(2*time.Second))
-
-	if len(mv.steps()) != 1 {
-		t.Fatalf("expected the timer to suppress further motion, got %v", mv.steps())
+	// The controller then goes silent for good: four more ticks pass with
+	// the same frozen events (five in total). A regression that clears
+	// motionSince inside the timer gate re-arms the delta path on every tick
+	// after the gate first fires -- each stop immediately followed by
+	// another step, a sawtooth -- which a run of only two ticks (as this
+	// test used to be) cannot catch: the sawtooth's second step doesn't
+	// land until the third tick, so steps==1/stops==1 holds either way at
+	// two ticks.
+	for i := 2; i <= 5; i++ {
+		arc.tick(context.Background(), frozen, start.Add(time.Duration(i)*time.Second))
 	}
-	if mv.stops() != 1 {
-		t.Fatalf("expected the timer to stop the mover once, got %d", mv.stops())
+
+	if len(mv.steps()) != 1 || mv.stops() != 1 {
+		t.Fatalf("expected the timer to latch after firing once, not sawtooth: got %d steps, %d stops", len(mv.steps()), mv.stops())
+	}
+
+	// The spec says motion resumes only once lastEventAt advances. Nothing
+	// above proves the gate ever un-latches -- it deliberately never clears
+	// its own trip condition -- so pin that a tick with genuinely fresh
+	// event timestamps lets motion through again.
+	recovered := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start.Add(10 * time.Second)},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(10 * time.Second)},
+	}
+	arc.tick(context.Background(), recovered, start.Add(10*time.Second))
+
+	if len(mv.steps()) != 2 {
+		t.Fatalf("expected motion to resume once lastEventAt advances, got %d steps", len(mv.steps()))
 	}
 }
 
 func TestDeadOperatorTimerResetsOnFreshEvents(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 	arc.maxContinuousMotion = time.Second
 
 	start := time.Now()
@@ -1106,7 +1129,6 @@ func TestDeadOperatorTimerResetsOnFreshEvents(t *testing.T) {
 func TestIdleTicksClearTheRunTimer(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 	arc.maxContinuousMotion = time.Second
 
 	start := time.Now()
@@ -1147,7 +1169,6 @@ func TestIdleTicksClearTheRunTimer(t *testing.T) {
 func TestDeadOperatorTimerCanBeDisabled(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 	arc.maxContinuousMotion = 0
 
 	start := time.Now()

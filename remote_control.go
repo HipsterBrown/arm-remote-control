@@ -547,7 +547,7 @@ type armRemoteControlGamepad struct {
 	// motion, zero when idle. Loop-owned; see the dead-operator timer.
 	//
 	// motionSince is a run timer only -- it resets on every idle tick, by
-	// design, so Task 7's dead-operator timer measures one unbroken run.
+	// design, so the dead-operator timer measures one unbroken run.
 	// needsStop is a latch instead: it is set whenever a step is dispatched
 	// and cleared only once mover.stop has actually fired, so an idle tick
 	// in between (stick centred, deadman still held) does not erase the
@@ -556,8 +556,10 @@ type armRemoteControlGamepad struct {
 	motionSince time.Time
 	needsStop   bool
 
-	// lastEventAt is the newest Event.Time seen across all controls.
-	// Loop-owned; see the dead-operator timer.
+	// lastEventAt is the newest Event.Time seen across all controls, updated
+	// only on ticks that reach the timer gate below, which is its only
+	// reader -- the gates above it (controller gone, E-stop latch and
+	// check, initialized) return early without touching it. Loop-owned.
 	lastEventAt time.Time
 
 	activeBackgroundWorkers sync.WaitGroup
@@ -818,7 +820,9 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	// docs/SPEC-teleop-safety-gripper.md "Gating order"): controller gone,
 	// then the E-stop gates, then initialized, then the deadman, then the
 	// dead-operator timer, and only then the delta. Insert new gates by
-	// authority, not convenience.
+	// authority, not convenience. Actions that are not gates -- the gripper
+	// dispatch -- go after the timer gate and before the zero-delta early
+	// return below.
 	if arc.requireEnable && !buttonPressed(events, input.ButtonLT) {
 		// Releasing the deadman ends the run, same as an idle tick.
 		arc.motionSince = time.Time{}
@@ -879,6 +883,14 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 // whole motion-service pipeline. In short, haltMotion is "stop if we were
 // moving" -- see forceHalt below for "stop regardless", which fault
 // conditions need instead.
+//
+// Every loop-side stop -- the deadman gate, the E-stop gate, the
+// dead-operator timer, and the controller-disconnect branch -- routes
+// through here (the latter two via forceHalt) rather than calling
+// arc.mover.stop directly; Close's teardown call, which does call
+// arc.mover.stop directly, is the one sanctioned exception, since by then
+// the movement loop has already stopped and there is no loop state left to
+// keep consistent.
 //
 // It guards on needsStop, not motionSince, because motionSince resets on
 // every idle tick while needsStop survives until the mover actually stops.
@@ -971,7 +983,8 @@ func (arc *armRemoteControlGamepad) DoCommand(ctx context.Context, cmd map[strin
 }
 
 func (arc *armRemoteControlGamepad) Close(context.Context) error {
-	// Stop motion first
+	// Calls arc.mover.stop directly rather than through haltMotion: the
+	// sanctioned exception documented on haltMotion's doc comment.
 	if arc.mover != nil {
 		if err := arc.mover.stop(context.Background()); err != nil {
 			arc.logger.Errorw("failed to stop during close", "error", err)
