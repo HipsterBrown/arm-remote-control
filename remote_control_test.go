@@ -172,7 +172,7 @@ func TestDirectModeSelectedWhenMotionServiceUnset(t *testing.T) {
 
 	// Behaviour unchanged: read EndPosition, add the delta, MoveToPosition.
 	fa.endPos = spatialmath.NewPose(r3.Vector{X: 1, Y: 2, Z: 3}, spatialmath.NewZeroOrientation())
-	if err := mv.step(ctx, 10, -5, 0); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 10, Y: -5, Z: 0}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step: %v", err)
 	}
 	calls := fa.getMoveCalls()
@@ -293,7 +293,7 @@ func TestStepEmitsTeleopMoveWithDeltaAndTopLevelComponentName(t *testing.T) {
 	}
 	cancel()
 
-	if err := mv.step(ctx, 0, 0, 10); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 0, Y: 0, Z: 10}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step: %v", err)
 	}
 
@@ -345,10 +345,10 @@ func TestStepDeltasAreRelativeNotAccumulating(t *testing.T) {
 	}
 	cancel()
 
-	if err := mv.step(ctx, 5, 0, 0); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 5, Y: 0, Z: 0}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step 1: %v", err)
 	}
-	if err := mv.step(ctx, 5, 0, 0); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 5, Y: 0, Z: 0}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step 2: %v", err)
 	}
 
@@ -477,7 +477,7 @@ func TestStatusErrorDuringOperationLogsAndDoesNotSwitchModes(t *testing.T) {
 	if _, ok := mv.(*teleopMover); !ok {
 		t.Fatalf("expected mover to remain *teleopMover after failures, got %T", mv)
 	}
-	if err := mv.step(ctx, 1, 0, 0); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 1, Y: 0, Z: 0}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step: %v", err)
 	}
 	if len(fa.getMoveCalls()) != 0 {
@@ -599,14 +599,14 @@ func TestButtonPressedAcceptsHold(t *testing.T) {
 // real mover.
 type fakeMover struct {
 	mu        sync.Mutex
-	stepCalls [][3]float64
+	stepCalls []spatialmath.Pose
 	stopCalls int
 }
 
-func (f *fakeMover) step(ctx context.Context, dx, dy, dz float64) error {
+func (f *fakeMover) step(ctx context.Context, delta spatialmath.Pose) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.stepCalls = append(f.stepCalls, [3]float64{dx, dy, dz})
+	f.stepCalls = append(f.stepCalls, delta)
 	return nil
 }
 
@@ -617,10 +617,10 @@ func (f *fakeMover) stop(ctx context.Context) error {
 	return nil
 }
 
-func (f *fakeMover) steps() [][3]float64 {
+func (f *fakeMover) steps() []spatialmath.Pose {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([][3]float64, len(f.stepCalls))
+	out := make([]spatialmath.Pose, len(f.stepCalls))
 	copy(out, f.stepCalls)
 	return out
 }
@@ -666,8 +666,8 @@ func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
 	if len(steps) != 1 {
 		t.Fatalf("expected 1 step call, got %d", len(steps))
 	}
-	if steps[0] != [3]float64{10, 0, 10} {
-		t.Fatalf("expected delta (10,0,10), got %v", steps[0])
+	if got := steps[0].Point(); got.X != 10 || got.Y != 0 || got.Z != 10 {
+		t.Fatalf("expected delta point (10,0,10), got %v", got)
 	}
 }
 
@@ -681,7 +681,7 @@ func TestZComesFromAnalogTriggers(t *testing.T) {
 	}, time.Now())
 
 	steps := mv.steps()
-	if len(steps) != 1 || steps[0][2] != 10.0 {
+	if len(steps) != 1 || steps[0].Point().Z != 10.0 {
 		t.Fatalf("expected dz=10 from a fully pressed right trigger, got %v", steps)
 	}
 }
@@ -710,7 +710,7 @@ func TestTriggersAreProportional(t *testing.T) {
 		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 0.5},
 	}, time.Now())
 
-	if steps := mv.steps(); len(steps) != 1 || steps[0][2] != 5.0 {
+	if steps := mv.steps(); len(steps) != 1 || steps[0].Point().Z != 5.0 {
 		t.Fatalf("expected dz=5 at half deflection, got %v", steps)
 	}
 }
@@ -766,7 +766,7 @@ func TestZFallsBackToDigitalTriggers(t *testing.T) {
 		input.ButtonRT2: {Event: input.ButtonPress},
 	}, time.Now())
 
-	if steps := mv.steps(); len(steps) != 1 || steps[0][2] != 10.0 {
+	if steps := mv.steps(); len(steps) != 1 || steps[0].Point().Z != 10.0 {
 		t.Fatalf("expected dz=10 from the digital right trigger, got %v", steps)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
 	commonpb "go.viam.com/api/common/v1"
 	motionpb "go.viam.com/api/service/motion/v1"
@@ -132,8 +133,9 @@ func resolveMaxContinuousMotion(conf *Config) time.Duration {
 // direct arm.MoveToPosition path and the motion service teleop pipeline; do
 // not add other abstractions around it.
 type mover interface {
-	// step applies a delta. Units are millimetres.
-	step(ctx context.Context, dx, dy, dz float64) error
+	// step applies a relative delta: translation in millimetres, rotation as
+	// a small orientation. Never accumulated across calls.
+	step(ctx context.Context, delta spatialmath.Pose) error
 	// stop halts motion. Always also calls arm.Stop where relevant.
 	stop(ctx context.Context) error
 }
@@ -145,16 +147,17 @@ type directMover struct {
 	arm arm.Arm
 }
 
-func (m *directMover) step(ctx context.Context, dx, dy, dz float64) error {
+func (m *directMover) step(ctx context.Context, delta spatialmath.Pose) error {
 	currentPose, err := m.arm.EndPosition(ctx, nil)
 	if err != nil {
 		return errors.Wrap(err, "failed to get current arm position")
 	}
 
+	d := delta.Point()
 	point := currentPose.Point()
-	point.X += dx
-	point.Y += dy
-	point.Z += dz
+	point.X += d.X
+	point.Y += d.Y
+	point.Z += d.Z
 
 	newPose := spatialmath.NewPose(point, currentPose.Orientation())
 	return m.arm.MoveToPosition(ctx, newPose, nil)
@@ -284,8 +287,9 @@ func (m *teleopMover) start(ctx context.Context) error {
 // step sends a relative delta as a single teleop_move call. It never
 // accumulates a target locally: each call carries only this tick's delta, and
 // the pipeline resolves it against its own live planning head.
-func (m *teleopMover) step(ctx context.Context, dx, dy, dz float64) error {
-	poseBytes, err := teleopMarshalOpts.Marshal(deltaPoseInFrame(m.componentName, dx, dy, dz))
+func (m *teleopMover) step(ctx context.Context, delta spatialmath.Pose) error {
+	d := delta.Point()
+	poseBytes, err := teleopMarshalOpts.Marshal(deltaPoseInFrame(m.componentName, d.X, d.Y, d.Z))
 	if err != nil {
 		return errors.Wrap(err, "failed to build teleop_move payload")
 	}
@@ -319,7 +323,7 @@ func (m *teleopMover) probe(ctx context.Context) error {
 		return errors.Wrap(err, "teleop startup probe: failed to read baseline status")
 	}
 
-	if err := m.step(ctx, 0, 0, 0); err != nil {
+	if err := m.step(ctx, spatialmath.NewZeroPose()); err != nil {
 		return errors.Wrap(err, "teleop startup probe: failed to send probe move")
 	}
 
@@ -937,8 +941,10 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	}
 	arc.needsStop = true
 
+	delta := spatialmath.NewPose(r3.Vector{X: dx, Y: dy, Z: dz}, spatialmath.NewZeroOrientation())
+
 	stepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	err := arc.mover.step(stepCtx, dx, dy, dz)
+	err := arc.mover.step(stepCtx, delta)
 	cancel()
 	if err != nil {
 		arc.logger.Errorw("failed to apply movement step", "error", err, "dx", dx, "dy", dy, "dz", dz)
