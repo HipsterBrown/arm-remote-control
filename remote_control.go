@@ -987,6 +987,17 @@ func (arc *armRemoteControlGamepad) stopGripper(ctx context.Context) {
 // Presses arriving while an operation is in flight are dropped, not queued:
 // a queue would keep acting on intent the operator formed seconds ago, which
 // is the opposite of teleoperation.
+//
+// This spawns with utils.PanicCapturingGo, not the ManagedGo the movement
+// loop uses in startContinuousMovement. ManagedGo restarts f on panic,
+// forever, which is right for a polling loop that should come back but wrong
+// for a one-shot actuator command: it would re-issue Grab/Open indefinitely
+// with no operator intent behind it, its onComplete (Done) never runs on the
+// panicking path (hanging Close's Wait), and the deferred gripperBusy.Store
+// releases well before any restart, letting a second goroutine start and
+// breaking the "one in flight" invariant the CAS above exists to guarantee.
+// PanicCapturingGo recovers, logs, and returns -- no restart, and this
+// goroutine's own deferred Done/gripperBusy-release still runs normally.
 func (arc *armRemoteControlGamepad) handleGripper(events map[input.Control]input.Event) {
 	if arc.gripper == nil {
 		return
@@ -1002,7 +1013,8 @@ func (arc *armRemoteControlGamepad) handleGripper(events map[input.Control]input
 	}
 
 	arc.activeBackgroundWorkers.Add(1)
-	utils.ManagedGo(func() {
+	utils.PanicCapturingGo(func() {
+		defer arc.activeBackgroundWorkers.Done()
 		defer arc.gripperBusy.Store(false)
 
 		if grab {
@@ -1021,7 +1033,7 @@ func (arc *armRemoteControlGamepad) handleGripper(events map[input.Control]input
 		if err := arc.gripper.Open(arc.cancelCtx, nil); err != nil {
 			arc.logger.Errorw("gripper open failed", "error", err)
 		}
-	}, arc.activeBackgroundWorkers.Done)
+	})
 }
 
 // zAxis returns the Z command in the range -1..1, from the analog triggers

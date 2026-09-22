@@ -1332,3 +1332,46 @@ func TestGripperControlsAreNoOpsWhenUnconfigured(t *testing.T) {
 	}, time.Now())
 	// Reaching here without a nil-pointer panic is the assertion.
 }
+
+// TestGripperDispatchGatedByDeadOperatorTimer pins the other load-bearing
+// boundary on the gripper dispatch call in tick: it must sit BELOW the
+// dead-operator timer gate, not above it. Above it, a frozen controller
+// still holding ButtonSouth re-fires Grab on every tick once gripperBusy
+// clears -- a runaway gripper driven by a dead controller, which is exactly
+// what the timer exists to prevent (see TestDeadOperatorTimerStopsFrozenController
+// for the equivalent motion-only case). Below it, the timer's own trip
+// stops the dispatch along with the arm.
+//
+// The timer needs *strictly greater than* maxContinuousMotion to trip, so
+// one dispatch inside that window is expected before the gate latches -- 2
+// calls, not 1, is correct here, not a bug. This does not claim ButtonSouth
+// is edge-triggered (it isn't: holding it re-fires Grab each time the
+// previous op completes, gripperBusy only bounds one op in flight at a
+// time); it claims the timer gate -- not the button -- is what bounds the
+// pile-up on a frozen controller.
+func TestGripperDispatchGatedByDeadOperatorTimer(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{} // returns immediately: no blocking channel
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	frozen := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonSouth:   {Event: input.ButtonPress, Time: start},
+	}
+
+	for i := 0; i < 11; i++ {
+		arc.tick(context.Background(), frozen, start.Add(time.Duration(i)*time.Second))
+		// Let the dispatched goroutine (if any) finish and release
+		// gripperBusy before the next tick, so the count below is
+		// deterministic rather than racing the background goroutine.
+		arc.activeBackgroundWorkers.Wait()
+	}
+
+	if grab, _, _ := fg.counts(); grab > 3 {
+		t.Fatalf("expected the dead-operator timer to bound gripper dispatch on a frozen controller, got %d Grab calls across 11 ticks", grab)
+	}
+}
