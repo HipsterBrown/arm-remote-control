@@ -993,10 +993,14 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	// Flat deadzone before these values reach us, and a second one would
 	// stack with it.
 	//
-	// EulerAngles' three fields compose in a fixed z-y'-x'' order, so at
-	// large deflection this is order-sensitive and can gimbal-lock. Per tick
-	// the default rotation_step_size keeps each axis to a couple of degrees,
-	// small enough that this isn't a concern in practice.
+	// EulerAngles' three fields compose in a fixed z-y'-x'' order, so at a
+	// large rotation_step_size this is order-sensitive and can gimbal-lock.
+	// Deflection itself is capped at +/-1.0 by the driver; it's a large
+	// configured rotation_step_size, not large deflection, that could reach
+	// gimbal-lock territory -- resolveRotationStepSize only floors
+	// non-positive values, it does not cap large ones. The default keeps
+	// each axis to a couple of degrees per tick, small enough that this
+	// isn't a concern in practice.
 	delta := spatialmath.NewPose(
 		r3.Vector{
 			X: axisValue(events, input.AbsoluteX) * scale,

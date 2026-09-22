@@ -867,14 +867,15 @@ func (f *fakeMover) stops() int {
 func newTestGamepad(t *testing.T, mv mover) *armRemoteControlGamepad {
 	t.Helper()
 	return &armRemoteControlGamepad{
-		mover:          mv,
-		logger:         newTestLogger(t),
-		stepSize:       10.0,
-		initialized:    true,
-		connected:      true,
-		analogTriggers: true,
-		requireEnable:  true,
-		cancelCtx:      context.Background(),
+		mover:            mv,
+		logger:           newTestLogger(t),
+		stepSize:         10.0,
+		rotationStepSize: defaultRotationStepSize,
+		initialized:      true,
+		connected:        true,
+		analogTriggers:   true,
+		requireEnable:    true,
+		cancelCtx:        context.Background(),
 	}
 }
 
@@ -1089,7 +1090,10 @@ func TestCombinedTranslationAndRotationDelta(t *testing.T) {
 	// The property: the translation component must land in the ARM frame --
 	// exactly where translation alone would put it -- and must NOT be rotated
 	// by the delta's own rotation. A naive monolithic Compose(current, delta)
-	// is off by up to ~153mm on cases in this shape.
+	// is off by ~5.2mm on this test's own numbers -- it produces
+	// (108.66, 195, 295) against the expected (110, 195, 300). The error
+	// scales with the per-tick delta (max ~17mm at step_size 10), not with
+	// the arm's position.
 	start := spatialmath.NewPose(
 		r3.Vector{X: 100, Y: 200, Z: 300},
 		&spatialmath.EulerAngles{Pitch: rdkutils.DegToRad(30)},
