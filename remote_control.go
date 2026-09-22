@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"go.viam.com/rdk/components/arm"
+	"go.viam.com/rdk/components/gripper"
 	"go.viam.com/rdk/components/input"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
@@ -495,12 +496,21 @@ type armRemoteControlGamepad struct {
 	logger          logging.Logger
 	cfg             *Config
 
+	// gripper binds the gripper controls, nil when Config.Gripper is unset
+	// (left nil until Task 8 wires it up; nothing calls Open/Grab yet).
+	gripper gripper.Gripper
+
 	cancelCtx  context.Context
 	cancelFunc func()
 
 	// State management
 	mu          sync.RWMutex
 	initialized bool
+
+	// estopped is written by tick, not an RPC handler, but is the natural
+	// thing for a future DoCommand to expose, so -- unlike connected and
+	// motionSince below -- it lives under mu rather than being loop-owned.
+	estopped bool
 
 	// stepSize, requireEnable, and maxContinuousMotion are resolved once from
 	// config in NewGamepad and never written again, so tick reads them
@@ -729,16 +739,48 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		if arc.connected {
 			arc.connected = false
 			arc.logger.Info("input controller disconnected, stopping arm")
-			// mover.stop, not arm.Stop directly: the teleop mover must also
-			// tear down its pipeline, and teleop_stop alone does not halt
-			// the arm.
-			if err := arc.mover.stop(ctx); err != nil {
-				arc.logger.Errorw("failed to stop on controller disconnect", "error", err)
-			}
+			arc.haltMotion(ctx)
 		}
 		return
 	}
 	arc.connected = true
+
+	// E-stop outranks every other gate, including the deadman (see
+	// docs/SPEC-teleop-safety-gripper.md "Gating order"). Latch on
+	// ButtonMenu or ButtonEStop; log, halt, and stop the gripper only on the
+	// latching transition, not on every tick it stays held.
+	if buttonPressed(events, input.ButtonMenu) || buttonPressed(events, input.ButtonEStop) {
+		arc.mu.Lock()
+		alreadyLatched := arc.estopped
+		arc.estopped = true
+		arc.mu.Unlock()
+
+		if !alreadyLatched {
+			arc.logger.Error("E-STOP engaged; press Start to clear")
+			// haltMotion only stops when motionSince is non-zero, but an
+			// E-stop must stop the arm regardless of what the service
+			// believes it was doing.
+			arc.motionSince = now
+			arc.haltMotion(ctx)
+			arc.stopGripper(ctx)
+		}
+		return
+	}
+
+	arc.mu.RLock()
+	estopped := arc.estopped
+	arc.mu.RUnlock()
+	if estopped {
+		// Latched. ButtonStart is the only input read until it clears; no
+		// other input is read while latched.
+		if buttonPressed(events, input.ButtonStart) {
+			arc.mu.Lock()
+			arc.estopped = false
+			arc.mu.Unlock()
+			arc.logger.Info("E-stop cleared")
+		}
+		return
+	}
 
 	arc.mu.RLock()
 	initialized := arc.initialized
@@ -747,11 +789,11 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		return
 	}
 
-	// Gates, most authoritative first (see docs/SPEC-teleop-safety-gripper.md
-	// "Gating order"): controller gone, then deadman. Insert new gates by
-	// authority, not convenience -- Task 6's E-stop outranks the deadman and
-	// belongs ABOVE this block; Task 7's dead-operator timer is subordinate
-	// to it and belongs immediately BELOW.
+	// Gates run most authoritative first (see
+	// docs/SPEC-teleop-safety-gripper.md "Gating order"): controller gone,
+	// then the E-stop gates above, then this deadman gate. Task 7's
+	// dead-operator timer is subordinate to the deadman and belongs
+	// immediately BELOW it. Insert new gates by authority, not convenience.
 	if arc.requireEnable && !buttonPressed(events, input.ButtonLT) {
 		arc.haltMotion(ctx)
 		return
@@ -789,11 +831,15 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 // whole motion-service pipeline.
 //
 // This is meant to be the one chokepoint for "stop, and remember we
-// stopped": every loop-side stop -- the deadman gate above, Task 6's E-stop,
-// Task 7's dead-operator timer -- should route through here rather than
-// calling arc.mover.stop directly. The controller-disconnect branch earlier
-// in tick is a known, scheduled-for-cleanup exception (Task 6), not a
-// pattern to copy, and neither is Close's teardown call.
+// stopped": every loop-side stop -- the deadman gate, the E-stop gate,
+// Task 7's dead-operator timer, and the controller-disconnect branch --
+// routes through here rather than calling arc.mover.stop directly. Close's
+// teardown call is the one exception, since by then there is no motionSince
+// left to keep consistent.
+//
+// mover.stop, not arm.Stop directly, is what every one of those call sites
+// gets by routing through here: the teleop mover must also tear down its
+// pipeline, and teleop_stop alone does not halt the arm.
 //
 // haltMotion is movement-goroutine-only: it writes motionSince, which is
 // unguarded loop-owned state (see the field comment), with no mutex. Do not
@@ -811,6 +857,18 @@ func (arc *armRemoteControlGamepad) haltMotion(ctx context.Context) {
 	arc.motionSince = time.Time{}
 	if err := arc.mover.stop(ctx); err != nil {
 		arc.logger.Errorw("failed to stop motion", "error", err)
+	}
+}
+
+// stopGripper halts the gripper if one is configured. Unlike the grab/open
+// path (Task 8) it does not wait on gripperBusy: interrupting an in-flight
+// gripper operation is the entire point of an E-stop.
+func (arc *armRemoteControlGamepad) stopGripper(ctx context.Context) {
+	if arc.gripper == nil {
+		return
+	}
+	if err := arc.gripper.Stop(ctx, nil); err != nil {
+		arc.logger.Errorw("failed to stop gripper", "error", err)
 	}
 }
 

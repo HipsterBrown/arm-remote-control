@@ -957,3 +957,68 @@ func TestValidateAcceptsZeroMaxContinuousMotion(t *testing.T) {
 		t.Fatalf("expected max_continuous_motion:0 (timer disabled) to be valid, got: %v", err)
 	}
 }
+
+func TestEStopLatchesAndBlocksMotion(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+
+	moving := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+
+	arc.tick(context.Background(), moving, time.Now())
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion before the E-stop, got %v", mv.steps())
+	}
+
+	estop := map[input.Control]input.Event{
+		input.ButtonMenu: {Event: input.ButtonPress},
+	}
+	arc.tick(context.Background(), estop, time.Now())
+	if mv.stops() != 1 {
+		t.Fatalf("expected the E-stop to stop the mover, got %d stops", mv.stops())
+	}
+
+	// Button released, but the latch holds.
+	arc.tick(context.Background(), moving, time.Now())
+	arc.tick(context.Background(), moving, time.Now())
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected no further motion while latched, got %v", mv.steps())
+	}
+}
+
+func TestEStopClearsOnStart(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+	arc.estopped = true
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonStart: {Event: input.ButtonPress},
+	}, time.Now())
+
+	moving := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+	arc.tick(context.Background(), moving, time.Now())
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion to resume after ButtonStart cleared the latch, got %v", mv.steps())
+	}
+}
+
+func TestEStopButtonAlsoLatches(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonEStop: {Event: input.ButtonPress},
+	}, time.Now())
+
+	if !arc.estopped {
+		t.Fatalf("expected input.ButtonEStop to latch the E-stop")
+	}
+}
