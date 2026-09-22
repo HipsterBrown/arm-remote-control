@@ -641,6 +641,7 @@ func newTestGamepad(t *testing.T, mv mover) *armRemoteControlGamepad {
 		initialized:    true,
 		connected:      true,
 		analogTriggers: true,
+		requireEnable:  true,
 		cancelCtx:      context.Background(),
 	}
 }
@@ -650,6 +651,7 @@ func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
 		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
 		input.AbsoluteRZ:    {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
@@ -668,6 +670,7 @@ func TestZComesFromAnalogTriggers(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
 		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
@@ -682,6 +685,7 @@ func TestOpposedTriggersCancel(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
 		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
 		input.AbsoluteZ:  {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
@@ -696,6 +700,7 @@ func TestTriggersAreProportional(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
 		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 0.5},
 	}, time.Now())
 
@@ -751,11 +756,76 @@ func TestZFallsBackToDigitalTriggers(t *testing.T) {
 	arc.analogTriggers = false // pad reports no AbsoluteZ/AbsoluteRZ
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:  {Event: input.ButtonPress},
 		input.ButtonRT2: {Event: input.ButtonPress},
 	}, time.Now())
 
 	if steps := mv.steps(); len(steps) != 1 || steps[0][2] != 10.0 {
 		t.Fatalf("expected dz=10 from the digital right trigger, got %v", steps)
+	}
+}
+
+func TestDeadmanBlocksMotionWhenNotHeld(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 0 {
+		t.Fatalf("expected no motion without the deadman held, got %v", mv.steps())
+	}
+}
+
+func TestDeadmanAllowsMotionWhenHeld(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected 1 step with the deadman held, got %v", mv.steps())
+	}
+}
+
+func TestDeadmanReleaseStopsExactlyOnce(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	held := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+	released := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonRelease},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}
+
+	arc.tick(context.Background(), held, time.Now())
+	arc.tick(context.Background(), released, time.Now())
+	arc.tick(context.Background(), released, time.Now())
+	arc.tick(context.Background(), released, time.Now())
+
+	if mv.stops() != 1 {
+		t.Fatalf("expected exactly 1 stop across three released ticks, got %d", mv.stops())
+	}
+}
+
+func TestDeadmanCanBeDisabled(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.requireEnable = false
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion without the deadman when require_enable is false, got %v", mv.steps())
 	}
 }
 

@@ -528,6 +528,10 @@ type armRemoteControlGamepad struct {
 	// movement goroutine, so it needs no lock.
 	connected bool
 
+	// motionSince is the start of the current unbroken run of commanded
+	// motion, zero when idle.
+	motionSince time.Time
+
 	activeBackgroundWorkers sync.WaitGroup
 }
 
@@ -736,12 +740,23 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		return
 	}
 
+	if arc.requireEnable && !buttonPressed(events, input.ButtonLT) {
+		arc.haltMotion(ctx)
+		return
+	}
+
 	dx := axisValue(events, input.AbsoluteHat0X) * arc.stepSize
 	dy := axisValue(events, input.AbsoluteHat0Y) * arc.stepSize
 	dz := arc.zAxis(events) * arc.stepSize
 
 	if dx == 0 && dy == 0 && dz == 0 {
+		// An idle tick ends the run of commanded motion.
+		arc.motionSince = time.Time{}
 		return
+	}
+
+	if arc.motionSince.IsZero() {
+		arc.motionSince = now
 	}
 
 	stepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -751,6 +766,21 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		arc.logger.Errorw("failed to apply movement step", "error", err, "dx", dx, "dy", dy, "dz", dz)
 	} else {
 		arc.logger.Debugf("Applied movement step: dx=%f dy=%f dz=%f", dx, dy, dz)
+	}
+}
+
+// haltMotion stops the mover if a run of commanded motion is in flight, and
+// clears motionSince. Calling it while already idle is a no-op: that is what
+// keeps a released deadman from calling mover.stop on every subsequent tick,
+// which matters because in teleop mode stop tears down and re-establishes the
+// whole motion-service pipeline.
+func (arc *armRemoteControlGamepad) haltMotion(ctx context.Context) {
+	if arc.motionSince.IsZero() {
+		return
+	}
+	arc.motionSince = time.Time{}
+	if err := arc.mover.stop(ctx); err != nil {
+		arc.logger.Errorw("failed to stop motion", "error", err)
 	}
 }
 
