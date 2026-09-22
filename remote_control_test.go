@@ -990,7 +990,6 @@ func TestValidateAcceptsZeroMaxContinuousMotion(t *testing.T) {
 func TestEStopLatchesAndBlocksMotion(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 
 	moving := map[input.Control]input.Event{
 		input.ButtonLT:      {Event: input.ButtonPress},
@@ -1005,9 +1004,14 @@ func TestEStopLatchesAndBlocksMotion(t *testing.T) {
 	estop := map[input.Control]input.Event{
 		input.ButtonMenu: {Event: input.ButtonPress},
 	}
-	arc.tick(context.Background(), estop, time.Now())
+	// Hold the E-stop down for several ticks, as an operator's thumb would.
+	// It must stop the mover on the latching transition only, not on every
+	// tick the button stays held.
+	for i := 0; i < 5; i++ {
+		arc.tick(context.Background(), estop, time.Now())
+	}
 	if mv.stops() != 1 {
-		t.Fatalf("expected the E-stop to stop the mover, got %d stops", mv.stops())
+		t.Fatalf("expected the E-stop to stop the mover exactly once across 5 held ticks, got %d stops", mv.stops())
 	}
 
 	// Button released, but the latch holds.
@@ -1021,7 +1025,6 @@ func TestEStopLatchesAndBlocksMotion(t *testing.T) {
 func TestEStopClearsOnStart(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
-	arc.analogTriggers = true
 	arc.estopped = true
 
 	arc.tick(context.Background(), map[input.Control]input.Event{

@@ -748,11 +748,7 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		if arc.connected {
 			arc.connected = false
 			arc.logger.Info("input controller disconnected, stopping arm")
-			// Force it: needsStop false does not mean the arm is
-			// stationary -- the last commanded move may still be
-			// executing (see forceHalt's doc) -- and a disconnect is a
-			// fault, not a normal idle, so it must stop the arm
-			// regardless of what our own bookkeeping believes.
+			// A fault, not a normal idle: see forceHalt's doc.
 			arc.forceHalt(ctx)
 		}
 		return
@@ -771,9 +767,7 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 
 		if !alreadyLatched {
 			arc.logger.Error("E-STOP engaged; press Start to clear")
-			// Force it: an E-stop must stop the arm regardless of what
-			// needsStop claims about a step having been dispatched (see
-			// forceHalt's doc).
+			// Must stop regardless of needsStop: see forceHalt's doc.
 			arc.forceHalt(ctx)
 			arc.stopGripper(ctx)
 		}
@@ -808,6 +802,8 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	// dead-operator timer is subordinate to the deadman and belongs
 	// immediately BELOW it. Insert new gates by authority, not convenience.
 	if arc.requireEnable && !buttonPressed(events, input.ButtonLT) {
+		// Releasing the deadman ends the run, same as an idle tick.
+		arc.motionSince = time.Time{}
 		arc.haltMotion(ctx)
 		return
 	}
@@ -817,13 +813,8 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	dz := arc.zAxis(events) * arc.stepSize
 
 	if dx == 0 && dy == 0 && dz == 0 {
-		// An idle tick ends the run timer. See the spec: the timer exists to
-		// catch a controller that went away, not an operator who paused.
-		// needsStop is untouched here -- an idle tick is not a stop, and
-		// this is exactly the gap TestDeadmanReleaseStopsAfterAnIdleTick
-		// pins: the operator centres the stick before releasing the
-		// deadman, and that idle tick must not erase the fact that the arm
-		// still needs to be stopped once the deadman does release.
+		// An idle tick ends the run timer, but is not itself a stop --
+		// needsStop is untouched here.
 		arc.motionSince = time.Time{}
 		return
 	}
@@ -851,25 +842,8 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 // moving" -- see forceHalt below for "stop regardless", which fault
 // conditions need instead.
 //
-// It guards on needsStop, not motionSince: motionSince is Task 7's run
-// timer and resets on every idle tick, by design, while needsStop is a
-// latch that survives idle ticks until the mover is actually told to stop.
-// Guarding on motionSince here was the bug -- an operator centres the stick
-// (an idle tick, clearing motionSince) before releasing the deadman, so by
-// the time the release lands there was nothing left to signal that a stop
-// was still owed.
-//
-// This is meant to be the one chokepoint for "stop, and remember we
-// stopped": every loop-side stop routes through here rather than calling
-// arc.mover.stop directly. The deadman gate and Task 7's dead-operator timer
-// call it directly; the E-stop gate and the controller-disconnect branch
-// call it via forceHalt, since those two must stop unconditionally rather
-// than relying on needsStop already being set. Close's teardown call is the
-// one exception, since by then there is no state left to keep consistent.
-//
-// mover.stop, not arm.Stop directly, is what every one of those call sites
-// gets by routing through here: the teleop mover must also tear down its
-// pipeline, and teleop_stop alone does not halt the arm.
+// It guards on needsStop, not motionSince, because motionSince resets on
+// every idle tick while needsStop survives until the mover actually stops.
 //
 // haltMotion is movement-goroutine-only: it writes needsStop, unguarded
 // loop-owned state (see the field comment), with no mutex. It does not
