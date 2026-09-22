@@ -836,9 +836,7 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	// docs/SPEC-teleop-safety-gripper.md "Gating order"): controller gone,
 	// then the E-stop gates, then initialized, then the deadman, then the
 	// dead-operator timer, and only then the delta. Insert new gates by
-	// authority, not convenience. Actions that are not gates -- the gripper
-	// dispatch -- go after the timer gate and before the zero-delta early
-	// return below.
+	// authority, not convenience.
 	if arc.requireEnable && !buttonPressed(events, input.ButtonLT) {
 		// Releasing the deadman ends the run, same as an idle tick.
 		arc.motionSince = time.Time{}
@@ -1017,12 +1015,22 @@ func (arc *armRemoteControlGamepad) handleGripper(events map[input.Control]input
 		defer arc.activeBackgroundWorkers.Done()
 		defer arc.gripperBusy.Store(false)
 
+		// ButtonSouth wins when both are held: closing on nothing is
+		// recoverable, opening mid-grasp drops the payload. Same reason the
+		// E-stop calls Stop, not Open.
 		if grab {
 			// Grab reports whether it actually closed on something. That
 			// boolean is the operator's only feedback that a grasp failed,
 			// so it is logged either way rather than discarded.
 			grabbed, err := arc.gripper.Grab(arc.cancelCtx, nil)
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					// Close cancels cancelCtx before waiting on this
+					// goroutine, so a clean shutdown mid-grasp lands here
+					// too -- that is not a fault, so it does not log as one.
+					arc.logger.Debugw("gripper grab failed", "error", err)
+					return
+				}
 				arc.logger.Errorw("gripper grab failed", "error", err)
 				return
 			}
@@ -1031,6 +1039,10 @@ func (arc *armRemoteControlGamepad) handleGripper(events map[input.Control]input
 		}
 
 		if err := arc.gripper.Open(arc.cancelCtx, nil); err != nil {
+			if errors.Is(err, context.Canceled) {
+				arc.logger.Debugw("gripper open failed", "error", err)
+				return
+			}
 			arc.logger.Errorw("gripper open failed", "error", err)
 		}
 	})
@@ -1065,7 +1077,12 @@ func (arc *armRemoteControlGamepad) DoCommand(ctx context.Context, cmd map[strin
 
 func (arc *armRemoteControlGamepad) Close(context.Context) error {
 	// Calls arc.mover.stop directly rather than through haltMotion: the
-	// sanctioned exception documented on haltMotion's doc comment.
+	// sanctioned exception documented on haltMotion's doc comment. Close does
+	// not call gripper.Stop: gripper.Stop holds position rather than
+	// releasing, so a shutdown that called it would change nothing about a
+	// completed grasp -- the E-stop path calls it because interrupting an
+	// in-flight operation is the point there, which doesn't apply to a clean
+	// shutdown.
 	if arc.mover != nil {
 		if err := arc.mover.stop(context.Background()); err != nil {
 			arc.logger.Errorw("failed to stop during close", "error", err)

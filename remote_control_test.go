@@ -1322,6 +1322,42 @@ func TestEStopStopsTheGripper(t *testing.T) {
 	}
 }
 
+// TestGripperDispatchRequiresTheDeadman pins the gating order structurally
+// documented in tick's comment (see docs/SPEC-teleop-safety-gripper.md
+// "Gating order"): the gripper dispatch sits below the deadman gate and the
+// E-stop latch, so neither a released deadman nor a latched E-stop can reach
+// it. Every other gripper test presses ButtonLT alongside the gripper
+// button, so none of them would catch the dispatch call being moved above
+// either gate -- this is the test that would.
+func TestGripperDispatchRequiresTheDeadman(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	// Deadman not held.
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+	arc.activeBackgroundWorkers.Wait()
+
+	if grab, _, _ := fg.counts(); grab != 0 {
+		t.Fatalf("expected no Grab calls with the deadman released, got %d", grab)
+	}
+
+	// E-stop latched, deadman held.
+	arc.estopped = true
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+	arc.activeBackgroundWorkers.Wait()
+
+	if grab, _, _ := fg.counts(); grab != 0 {
+		t.Fatalf("expected no Grab calls with the E-stop latched, got %d", grab)
+	}
+}
+
 func TestGripperControlsAreNoOpsWhenUnconfigured(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv) // arc.gripper stays nil
@@ -1371,7 +1407,7 @@ func TestGripperDispatchGatedByDeadOperatorTimer(t *testing.T) {
 		arc.activeBackgroundWorkers.Wait()
 	}
 
-	if grab, _, _ := fg.counts(); grab > 3 {
+	if grab, _, _ := fg.counts(); grab != 2 {
 		t.Fatalf("expected the dead-operator timer to bound gripper dispatch on a frozen controller, got %d Grab calls across 11 ticks", grab)
 	}
 }
