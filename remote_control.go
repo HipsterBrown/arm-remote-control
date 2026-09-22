@@ -563,11 +563,27 @@ type armRemoteControlGamepad struct {
 	motionSince time.Time
 	needsStop   bool
 
-	// lastEventAt is the newest Event.Time seen across all controls, updated
-	// only on ticks that reach the timer gate below, which is its only
-	// reader -- the gates above it (controller gone, E-stop latch and
-	// check, initialized) return early without touching it. Loop-owned.
-	lastEventAt time.Time
+	// lastEventAt is the newest Event.Time seen across all controls -- the
+	// controller's own clock, passed through verbatim by the RDK's unary
+	// Events() client path. It exists only to detect whether the
+	// controller's events have advanced at all; it must never be compared
+	// against now, which comes from the host's clock. A modular or remote
+	// controller can run on a clock that drifts from the host's by more
+	// than maxContinuousMotion, and comparing across clocks either disables
+	// this gate silently (controller ahead of the host) or trips it
+	// immediately and permanently (controller behind).
+	//
+	// lastEventChangeAt is the host-clock (now) timestamp of the tick on
+	// which lastEventAt last advanced. The dead-operator timer gates on
+	// this field, not lastEventAt, so both sides of that comparison come
+	// from the same clock -- do not collapse these back into one field.
+	//
+	// Both are updated only on ticks that reach the timer gate below, which
+	// is their only reader -- the gates above it (controller gone, E-stop
+	// latch and check, initialized) return early without touching them.
+	// Loop-owned.
+	lastEventAt       time.Time
+	lastEventChangeAt time.Time
 
 	activeBackgroundWorkers sync.WaitGroup
 }
@@ -622,6 +638,17 @@ func NewGamepad(ctx context.Context, deps resource.Dependencies, name resource.N
 		analogTriggers:      hasAnalogTriggers(ctx, controller, logger),
 		movementStop:        make(chan struct{}),
 		connected:           true,
+	}
+
+	// A silently-configured loss of automatic protection is worse than a
+	// noisy one: this is a legitimate configuration (not a Validate error),
+	// but the operator should know what they gave up.
+	if !arc.requireEnable {
+		if arc.maxContinuousMotion == 0 {
+			logger.Warn("require_enable is false and max_continuous_motion is 0: no automatic protection remains against a stuck or vanished controller; only the manual E-stop does")
+		} else {
+			logger.Warn("require_enable is false: the deadman is disabled, so the dead-operator timer is now the only automatic protection against a stuck or vanished controller")
+		}
 	}
 
 	mv, err := newMover(ctx, deps, conf, arm1, logger, cancelCtx, &arc.activeBackgroundWorkers)
@@ -786,6 +813,12 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 			arc.logger.Info("input controller disconnected, stopping arm")
 			// A fault, not a normal idle: see forceHalt's doc.
 			arc.forceHalt(ctx)
+			// Same reasoning as the deadman gate: a vanished controller must
+			// not leave the gripper closing/opening. Guarded because this is
+			// also a fault path, same as the E-stop gate below.
+			if arc.gripperBusy.Load() {
+				arc.stopGripper(ctx)
+			}
 		}
 		return
 	}
@@ -841,24 +874,35 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		// Releasing the deadman ends the run, same as an idle tick.
 		arc.motionSince = time.Time{}
 		arc.haltMotion(ctx)
+		// The deadman gates the gripper too: a closing/opening gripper left
+		// running past a released deadman is a pinch hazard, and releasing
+		// the deadman is the operator's hands-off reflex. Guarded on
+		// gripperBusy, not called unconditionally -- this gate is entered on
+		// every tick the deadman is up, and an unguarded stopGripper would
+		// call gripper.Stop at 10Hz while the gripper is simply idle.
+		if arc.gripperBusy.Load() {
+			arc.stopGripper(ctx)
+		}
 		return
 	}
 
 	if at := newestEvent(events); at.After(arc.lastEventAt) {
 		arc.lastEventAt = at
+		arc.lastEventChangeAt = now
 	}
 
 	// Dead-operator timer: motion has been commanded continuously, and
-	// nothing on the controller has changed in that whole window. Do not
-	// clear motionSince here -- see haltMotion's doc and the spec's
-	// dead-operator section: clearing it would un-latch this gate's own
-	// condition and produce a step/stop sawtooth against a vanished
-	// controller.
+	// nothing on the controller has changed in that whole window. Gated on
+	// lastEventChangeAt (host clock), not lastEventAt (controller clock) --
+	// see the field comment. Do not clear motionSince here -- see
+	// haltMotion's doc and the spec's dead-operator section: clearing it
+	// would un-latch this gate's own condition and produce a step/stop
+	// sawtooth against a vanished controller.
 	if arc.maxContinuousMotion > 0 && !arc.motionSince.IsZero() &&
-		now.Sub(arc.lastEventAt) > arc.maxContinuousMotion {
+		now.Sub(arc.lastEventChangeAt) > arc.maxContinuousMotion {
 		arc.logger.Warnf(
 			"no controller activity for %v while commanding motion; stopping",
-			now.Sub(arc.lastEventAt),
+			now.Sub(arc.lastEventChangeAt),
 		)
 		arc.haltMotion(ctx)
 		return
@@ -898,10 +942,12 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 // haltMotion stops the mover if a step is still owed a stop, and clears
 // needsStop. Calling it while already idle is a no-op: that is what keeps a
 // released deadman from calling mover.stop on every subsequent tick, which
-// matters because in teleop mode stop tears down and re-establishes the
-// whole motion-service pipeline. In short, haltMotion is "stop if we were
-// moving" -- see forceHalt below for "stop regardless", which fault
-// conditions need instead.
+// matters because in teleop mode stop tears down the whole motion-service
+// pipeline -- teleopMover.stop does not re-establish it; only the 1Hz
+// checkStatus poller does, so redundant stop calls would mean redundant
+// teardowns with no corresponding redundant setup. In short, haltMotion is
+// "stop if we were moving" -- see forceHalt below for "stop regardless",
+// which fault conditions need instead.
 //
 // Every loop-side stop -- the deadman gate, the E-stop gate, the
 // dead-operator timer, and the controller-disconnect branch -- routes
@@ -934,7 +980,7 @@ func (arc *armRemoteControlGamepad) haltMotion(ctx context.Context) {
 	// not retried on the next tick -- considered, not missed: the
 	// alternative is leaving needsStop set on error, which retries at 10Hz
 	// against a mover that just failed to stop, and in teleop mode that
-	// means hammering pipeline teardown/re-establish on every tick. The
+	// means hammering the pipeline with teardown calls on every tick. The
 	// error is still logged, and any subsequent step re-arms needsStop.
 	arc.needsStop = false
 	if err := arc.mover.stop(ctx); err != nil {

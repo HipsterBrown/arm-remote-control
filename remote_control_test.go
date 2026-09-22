@@ -1186,6 +1186,44 @@ func TestDeadOperatorTimerCanBeDisabled(t *testing.T) {
 	}
 }
 
+// TestDeadOperatorTimerUsesHostClockNotControllerClock pins the timer to the
+// host's clock (`now`), not the controller's (`Event.Time`). A modular or
+// remote controller's clock can drift from the host's; if the gate compared
+// now against a controller timestamp directly, a controller clock running
+// ahead of the host by more than maxContinuousMotion would make
+// now.Sub(lastEventAt) permanently negative, silently disabling the gate.
+func TestDeadOperatorTimerUsesHostClockNotControllerClock(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	// The controller's own clock reports timestamps an hour ahead of the
+	// host's -- e.g. a modular/remote controller with clock drift.
+	aheadOfHost := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start.Add(time.Hour)},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(time.Hour)},
+	}
+
+	arc.tick(context.Background(), aheadOfHost, start)
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion at the start, got %v", mv.steps())
+	}
+
+	// The host clock advances well past the timeout; the controller's
+	// (unchanged) event timestamps still read far in the future relative to
+	// the host. The gate must still fire, because it is host-clock-only.
+	arc.tick(context.Background(), aheadOfHost, start.Add(2*time.Second))
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected the timer to still suppress motion despite the controller's clock running ahead, got %v", mv.steps())
+	}
+	if mv.stops() != 1 {
+		t.Fatalf("expected the timer to stop the mover once, got %d", mv.stops())
+	}
+}
+
 // fakeGripper satisfies gripper.Gripper. block, when non-nil, holds Grab and
 // Open until closed, standing in for slow hardware.
 type fakeGripper struct {
@@ -1320,6 +1358,33 @@ func TestEStopStopsTheGripper(t *testing.T) {
 	if _, _, stop := fg.counts(); stop != 1 {
 		t.Fatalf("expected the E-stop to stop the gripper, got %d Stop calls", stop)
 	}
+}
+
+// TestDeadmanReleaseStopsTheGripper mirrors TestEStopStopsTheGripper: the
+// deadman must be able to interrupt an in-flight gripper operation, not just
+// arm motion. Without this, releasing the deadman mid-grasp stops the arm
+// but leaves the jaws closing on real hardware -- the operator's hands-off
+// reflex would not actually stop the pinch hazard.
+func TestDeadmanReleaseStopsTheGripper(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+
+	// Deadman released while the grab is still in flight.
+	arc.tick(context.Background(), map[input.Control]input.Event{}, time.Now())
+
+	if _, _, stop := fg.counts(); stop != 1 {
+		t.Fatalf("expected releasing the deadman to stop an in-flight gripper operation, got %d Stop calls", stop)
+	}
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
 }
 
 // TestGripperDispatchRequiresTheDeadman pins the gating order structurally
