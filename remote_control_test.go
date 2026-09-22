@@ -1164,6 +1164,18 @@ func TestExplicitSafetyFieldsAreHonoured(t *testing.T) {
 	}
 }
 
+func TestRotationStepSizeDefaults(t *testing.T) {
+	if got := resolveRotationStepSize(&Config{}); got != defaultRotationStepSize {
+		t.Fatalf("expected rotation_step_size to default to %v, got %v", defaultRotationStepSize, got)
+	}
+	if got := resolveRotationStepSize(&Config{RotationStepSize: 5.0}); got != 5.0 {
+		t.Fatalf("expected an explicit rotation_step_size to be honoured, got %v", got)
+	}
+	if got := resolveRotationStepSize(&Config{RotationStepSize: -1}); got != defaultRotationStepSize {
+		t.Fatalf("expected a negative rotation_step_size to fall back to the default, got %v", got)
+	}
+}
+
 func TestValidateAddsGripperDependencyWhenSet(t *testing.T) {
 	deps, _, err := (&Config{
 		ArmName:             "arm-1",

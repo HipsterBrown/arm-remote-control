@@ -34,6 +34,9 @@ var (
 const (
 	defaultStepSize = 10.0 // mm for all axis movements
 
+	defaultRotationStepSize = 2.0 // degrees per axis per 10Hz tick
+	fineScale               = 0.25
+
 	teleopStatusPollInterval = time.Second
 	teleopProbeTimeout       = 2 * time.Second
 	teleopProbePollInterval  = 100 * time.Millisecond
@@ -88,6 +91,13 @@ type Config struct {
 	// is the conservative direction (more constrained planning, which fails
 	// to plan rather than moving with drifting orientation).
 	PositionOnly bool `json:"position_only,omitempty"`
+	// RotationStepSize is the maximum rotation in degrees per axis per tick
+	// at full stick deflection. Like PositionOnly, this is a plain float64
+	// rather than a pointer: the zero value means "unset", there is no
+	// third state to distinguish from unset, and falling back to
+	// defaultRotationStepSize is a safe, conventional default rather than a
+	// safety-critical one.
+	RotationStepSize float64 `json:"rotation_step_size,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid and important fields exist.
@@ -139,6 +149,17 @@ func resolveMaxContinuousMotion(conf *Config) time.Duration {
 		return defaultMaxContinuousMotion
 	}
 	return time.Duration(*conf.MaxContinuousMotion) * time.Second
+}
+
+// resolveRotationStepSize defaults an unset or non-positive
+// rotation_step_size to defaultRotationStepSize, matching how stepSize is
+// handled. Unlike the Stage 1 safety flags, the zero value is a safe
+// default here, so no pointer is needed.
+func resolveRotationStepSize(conf *Config) float64 {
+	if conf.RotationStepSize <= 0 {
+		return defaultRotationStepSize
+	}
+	return conf.RotationStepSize
 }
 
 // mover applies teleop deltas to the arm. It is the only seam between the
@@ -555,14 +576,15 @@ type armRemoteControlGamepad struct {
 	// motionSince below -- it lives under mu rather than being loop-owned.
 	estopped bool
 
-	// stepSize, requireEnable, and maxContinuousMotion are resolved once from
-	// config in NewGamepad and never written again, so tick reads them
-	// lock-free even though they sit in this mu-guarded block. Do not add a
-	// field here that is written after construction without also giving it
-	// mu protection.
+	// stepSize, requireEnable, maxContinuousMotion, and rotationStepSize are
+	// resolved once from config in NewGamepad and never written again, so
+	// tick reads them lock-free even though they sit in this mu-guarded
+	// block. Do not add a field here that is written after construction
+	// without also giving it mu protection.
 	stepSize            float64
 	requireEnable       bool
 	maxContinuousMotion time.Duration
+	rotationStepSize    float64
 
 	// analogTriggers records whether this pad reports AbsoluteZ/AbsoluteRZ.
 	// Several mappings in gamepad_mappings_linux.go do not, exposing their
@@ -671,6 +693,7 @@ func NewGamepad(ctx context.Context, deps resource.Dependencies, name resource.N
 		stepSize:            stepSize,
 		requireEnable:       resolveRequireEnable(conf),
 		maxContinuousMotion: resolveMaxContinuousMotion(conf),
+		rotationStepSize:    resolveRotationStepSize(conf),
 		analogTriggers:      hasAnalogTriggers(ctx, controller, logger),
 		movementStop:        make(chan struct{}),
 		connected:           true,
