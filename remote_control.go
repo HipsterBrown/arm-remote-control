@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
 	commonpb "go.viam.com/api/common/v1"
 	motionpb "go.viam.com/api/service/motion/v1"
@@ -22,6 +23,7 @@ import (
 	"go.viam.com/rdk/services/motion"
 	motionbuiltin "go.viam.com/rdk/services/motion/builtin"
 	"go.viam.com/rdk/spatialmath"
+	rdkutils "go.viam.com/rdk/utils"
 	"go.viam.com/utils/rpc"
 )
 
@@ -32,6 +34,9 @@ var (
 
 const (
 	defaultStepSize = 10.0 // mm for all axis movements
+
+	defaultRotationStepSize = 2.0 // degrees per axis per 10Hz tick
+	fineScale               = 0.25
 
 	teleopStatusPollInterval = time.Second
 	teleopProbeTimeout       = 2 * time.Second
@@ -75,6 +80,26 @@ type Config struct {
 	// the timer, while an omitted field must mean the default, and a plain
 	// int cannot tell those apart.
 	MaxContinuousMotion *int `json:"max_continuous_motion,omitempty"`
+	// PositionOnly sets goal_metric_type=position_only on teleop_start,
+	// leaving orientation unconstrained. Required for arms with fewer than
+	// six DOF, which cannot hold an orientation while translating -- but it
+	// also makes the planner IGNORE goal orientation, so the rotation
+	// controls become inert. Teleop mode only.
+	//
+	// A plain bool, not a pointer, is correct here -- unlike RequireEnable
+	// and MaxContinuousMotion above -- because the zero value false is the
+	// intended default: there is no third state to distinguish, and false
+	// is the conservative direction (more constrained planning, which fails
+	// to plan rather than moving with drifting orientation).
+	PositionOnly bool `json:"position_only,omitempty"`
+	// RotationStepSize is the maximum rotation in degrees per axis per tick
+	// at full stick deflection. Like PositionOnly, this is a plain float64
+	// rather than a pointer: 0 could be read as "no rotation", a coherent
+	// reading unlike step_size's, but it is deliberately treated as unset
+	// to match step_size. An operator who wants no rotation should simply
+	// not deflect the stick. Falling back to defaultRotationStepSize is a
+	// conventional default rather than a safety-critical one.
+	RotationStepSize float64 `json:"rotation_step_size,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid and important fields exist.
@@ -128,12 +153,26 @@ func resolveMaxContinuousMotion(conf *Config) time.Duration {
 	return time.Duration(*conf.MaxContinuousMotion) * time.Second
 }
 
+// resolveRotationStepSize defaults an unset or non-positive
+// rotation_step_size to defaultRotationStepSize, matching how stepSize is
+// handled. Unlike the Stage 1 safety flags, the zero value is a safe
+// default here, so no pointer is needed.
+func resolveRotationStepSize(conf *Config) float64 {
+	if conf.RotationStepSize <= 0 {
+		return defaultRotationStepSize
+	}
+	return conf.RotationStepSize
+}
+
 // mover applies teleop deltas to the arm. It is the only seam between the
 // direct arm.MoveToPosition path and the motion service teleop pipeline; do
 // not add other abstractions around it.
 type mover interface {
-	// step applies a delta. Units are millimetres.
-	step(ctx context.Context, dx, dy, dz float64) error
+	// step applies a relative delta: translation in millimetres, rotation as
+	// a small orientation. Translation is applied in the arm/reference
+	// frame; rotation is composed onto the tool (for teleopMover, onto the
+	// configured reference frame). Never accumulated across calls.
+	step(ctx context.Context, delta spatialmath.Pose) error
 	// stop halts motion. Always also calls arm.Stop where relevant.
 	stop(ctx context.Context) error
 }
@@ -145,18 +184,29 @@ type directMover struct {
 	arm arm.Arm
 }
 
-func (m *directMover) step(ctx context.Context, dx, dy, dz float64) error {
+// step adds the delta's translation in the arm's own frame and composes its
+// rotation onto the tool.
+//
+// These are deliberately two different operations. Compose(current, delta)
+// with a delta carrying both would rotate the translation into the tool
+// frame as well, which is a different control scheme: the operator's
+// "forward" would change every time they twisted the wrist.
+//
+// Compose(a, b) is A(B(x)), so composing a zero-translation rotation leaves
+// the point untouched and yields current ∘ delta -- a tool-frame rotation,
+// which is what a wrist physically does.
+func (m *directMover) step(ctx context.Context, delta spatialmath.Pose) error {
 	currentPose, err := m.arm.EndPosition(ctx, nil)
 	if err != nil {
 		return errors.Wrap(err, "failed to get current arm position")
 	}
 
-	point := currentPose.Point()
-	point.X += dx
-	point.Y += dy
-	point.Z += dz
+	point := currentPose.Point().Add(delta.Point())
 
-	newPose := spatialmath.NewPose(point, currentPose.Orientation())
+	newPose := spatialmath.Compose(
+		spatialmath.NewPose(point, currentPose.Orientation()),
+		spatialmath.NewPoseFromOrientation(delta.Orientation()),
+	)
 	return m.arm.MoveToPosition(ctx, newPose, nil)
 }
 
@@ -174,6 +224,9 @@ type teleopMover struct {
 	arm           arm.Arm
 	componentName string // also the reference frame deltas are expressed in
 	logger        logging.Logger
+	// positionOnly sets goal_metric_type=position_only on teleop_start. See
+	// Config.PositionOnly.
+	positionOnly bool
 
 	mu              sync.Mutex
 	consecutiveErrs int
@@ -196,12 +249,14 @@ func newTeleopMover(
 	logger logging.Logger,
 	cancelCtx context.Context,
 	wg *sync.WaitGroup,
+	positionOnly bool,
 ) (*teleopMover, error) {
 	tm := &teleopMover{
 		motionSvc:     motionSvc,
 		arm:           armDep,
 		componentName: componentName,
 		logger:        logger,
+		positionOnly:  positionOnly,
 	}
 
 	if err := tm.start(ctx); err != nil {
@@ -224,17 +279,20 @@ func newTeleopMover(
 var teleopMarshalOpts = protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}
 
 // deltaPoseInFrame builds the PoseInFrame proto used as both teleop_start's
-// destination and teleop_move's payload. The orientation is always the
-// identity orientation vector (o_z=1, theta=0): this mover only ever
-// expresses translation, never rotation.
-func deltaPoseInFrame(frame string, dx, dy, dz float64) *commonpb.PoseInFrame {
+// destination and teleop_move's payload, from a relative pose delta.
+func deltaPoseInFrame(frame string, delta spatialmath.Pose) *commonpb.PoseInFrame {
+	pt := delta.Point()
+	ov := delta.Orientation().OrientationVectorDegrees()
 	return &commonpb.PoseInFrame{
 		ReferenceFrame: frame,
 		Pose: &commonpb.Pose{
-			X:  dx,
-			Y:  dy,
-			Z:  dz,
-			OZ: 1,
+			X:     pt.X,
+			Y:     pt.Y,
+			Z:     pt.Z,
+			OX:    ov.OX,
+			OY:    ov.OY,
+			OZ:    ov.OZ,
+			Theta: ov.Theta,
 		},
 	}
 }
@@ -246,30 +304,31 @@ func deltaPoseInFrame(frame string, dx, dy, dz float64) *commonpb.PoseInFrame {
 // against go.viam.com/rdk@v1.7.0/services/motion/builtin/teleop.go, not a
 // typo carried over from the spec.
 func (m *teleopMover) start(ctx context.Context) error {
-	// Plan for position only, leaving orientation unconstrained.
-	//
-	// A PoseInFrame always carries an orientation, so an identity-rotation
-	// delta still asks the planner to hold the tool's current orientation
-	// exactly. On an arm with fewer than six degrees of freedom that is
-	// generally unsatisfiable while translating: the RoArm-M3 has no wrist
-	// yaw, so its base joint sets both the tool's azimuth and the working
-	// plane, and any sideways move changes the orientation it was told to
-	// hold. The planner then returns zero IK solutions for X and Y while Z
-	// still succeeds, because motion along the approach axis stays in plane.
-	//
-	// The arm driver already passes this on its own MoveToPosition path,
-	// which is why direct mode works where teleop mode did not.
-	extra, err := structpb.NewStruct(map[string]interface{}{
-		"goal_metric_type": "position_only",
-	})
-	if err != nil {
-		return errors.Wrap(err, "failed to build teleop_start extra")
-	}
 	req := &motionpb.MoveRequest{
 		ComponentName: m.componentName,
-		Destination:   deltaPoseInFrame(m.componentName, 0, 0, 0),
-		Extra:         extra,
+		Destination:   deltaPoseInFrame(m.componentName, spatialmath.NewZeroPose()),
 	}
+
+	// position_only is opt-in (Config.PositionOnly): it zeroes the
+	// orientation weight in the planner's goal metric, so setting it
+	// unconditionally would make every rotation command silently do
+	// nothing. It exists at all as an escape hatch for arms with fewer than
+	// six degrees of freedom, which generally cannot hold an orientation
+	// while translating: the RoArm-M3 has no wrist yaw, so its base joint
+	// sets both the tool's azimuth and the working plane, and any sideways
+	// move changes the orientation it was told to hold. The planner then
+	// returns zero IK solutions for X and Y while Z still succeeds, because
+	// motion along the approach axis stays in plane.
+	if m.positionOnly {
+		extra, err := structpb.NewStruct(map[string]interface{}{
+			"goal_metric_type": "position_only",
+		})
+		if err != nil {
+			return errors.Wrap(err, "failed to build teleop_start extra")
+		}
+		req.Extra = extra
+	}
+
 	payload, err := teleopMarshalOpts.Marshal(req)
 	if err != nil {
 		return errors.Wrap(err, "failed to build teleop_start payload")
@@ -284,8 +343,8 @@ func (m *teleopMover) start(ctx context.Context) error {
 // step sends a relative delta as a single teleop_move call. It never
 // accumulates a target locally: each call carries only this tick's delta, and
 // the pipeline resolves it against its own live planning head.
-func (m *teleopMover) step(ctx context.Context, dx, dy, dz float64) error {
-	poseBytes, err := teleopMarshalOpts.Marshal(deltaPoseInFrame(m.componentName, dx, dy, dz))
+func (m *teleopMover) step(ctx context.Context, delta spatialmath.Pose) error {
+	poseBytes, err := teleopMarshalOpts.Marshal(deltaPoseInFrame(m.componentName, delta))
 	if err != nil {
 		return errors.Wrap(err, "failed to build teleop_move payload")
 	}
@@ -319,7 +378,7 @@ func (m *teleopMover) probe(ctx context.Context) error {
 		return errors.Wrap(err, "teleop startup probe: failed to read baseline status")
 	}
 
-	if err := m.step(ctx, 0, 0, 0); err != nil {
+	if err := m.step(ctx, spatialmath.NewZeroPose()); err != nil {
 		return errors.Wrap(err, "teleop startup probe: failed to send probe move")
 	}
 
@@ -484,7 +543,7 @@ func newMover(
 		referenceFrame = conf.ArmName
 	}
 
-	return newTeleopMover(ctx, motionSvc, armDep, referenceFrame, logger, cancelCtx, wg)
+	return newTeleopMover(ctx, motionSvc, armDep, referenceFrame, logger, cancelCtx, wg, conf.PositionOnly)
 }
 
 type armRemoteControlGamepad struct {
@@ -519,14 +578,15 @@ type armRemoteControlGamepad struct {
 	// motionSince below -- it lives under mu rather than being loop-owned.
 	estopped bool
 
-	// stepSize, requireEnable, and maxContinuousMotion are resolved once from
-	// config in NewGamepad and never written again, so tick reads them
-	// lock-free even though they sit in this mu-guarded block. Do not add a
-	// field here that is written after construction without also giving it
-	// mu protection.
+	// stepSize, requireEnable, maxContinuousMotion, and rotationStepSize are
+	// resolved once from config in NewGamepad and never written again, so
+	// tick reads them lock-free even though they sit in this mu-guarded
+	// block. Do not add a field here that is written after construction
+	// without also giving it mu protection.
 	stepSize            float64
 	requireEnable       bool
 	maxContinuousMotion time.Duration
+	rotationStepSize    float64
 
 	// analogTriggers records whether this pad reports AbsoluteZ/AbsoluteRZ.
 	// Several mappings in gamepad_mappings_linux.go do not, exposing their
@@ -635,6 +695,7 @@ func NewGamepad(ctx context.Context, deps resource.Dependencies, name resource.N
 		stepSize:            stepSize,
 		requireEnable:       resolveRequireEnable(conf),
 		maxContinuousMotion: resolveMaxContinuousMotion(conf),
+		rotationStepSize:    resolveRotationStepSize(conf),
 		analogTriggers:      hasAnalogTriggers(ctx, controller, logger),
 		movementStop:        make(chan struct{}),
 		connected:           true,
@@ -921,11 +982,39 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	// doc for why both boundaries are load-bearing.
 	arc.handleGripper(events)
 
-	dx := axisValue(events, input.AbsoluteHat0X) * arc.stepSize
-	dy := axisValue(events, input.AbsoluteHat0Y) * arc.stepSize
-	dz := arc.zAxis(events) * arc.stepSize
+	scale := arc.stepSize
+	rot := arc.rotationStepSize
+	if buttonPressed(events, input.ButtonRT) {
+		scale *= fineScale
+		rot *= fineScale
+	}
 
-	if dx == 0 && dy == 0 && dz == 0 {
+	// No deadzone here: gamepad_linux.go already applies the evdev-reported
+	// Flat deadzone before these values reach us, and a second one would
+	// stack with it.
+	//
+	// EulerAngles' three fields compose in a fixed z-y'-x'' order, so at a
+	// large rotation_step_size this is order-sensitive and can gimbal-lock.
+	// Deflection itself is capped at +/-1.0 by the driver; it's a large
+	// configured rotation_step_size, not large deflection, that could reach
+	// gimbal-lock territory -- resolveRotationStepSize only floors
+	// non-positive values, it does not cap large ones. The default keeps
+	// each axis to a couple of degrees per tick, small enough that this
+	// isn't a concern in practice.
+	delta := spatialmath.NewPose(
+		r3.Vector{
+			X: axisValue(events, input.AbsoluteX) * scale,
+			Y: axisValue(events, input.AbsoluteY) * scale,
+			Z: arc.zAxis(events) * scale,
+		},
+		&spatialmath.EulerAngles{
+			Roll:  rdkutils.DegToRad(axisValue(events, input.AbsoluteHat0X) * rot),
+			Pitch: rdkutils.DegToRad(axisValue(events, input.AbsoluteRY) * rot),
+			Yaw:   rdkutils.DegToRad(axisValue(events, input.AbsoluteRX) * rot),
+		},
+	)
+
+	if spatialmath.PoseAlmostEqual(delta, spatialmath.NewZeroPose()) {
 		// An idle tick ends the run timer, but is not itself a stop --
 		// needsStop is untouched here.
 		arc.motionSince = time.Time{}
@@ -938,12 +1027,12 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	arc.needsStop = true
 
 	stepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	err := arc.mover.step(stepCtx, dx, dy, dz)
+	err := arc.mover.step(stepCtx, delta)
 	cancel()
 	if err != nil {
-		arc.logger.Errorw("failed to apply movement step", "error", err, "dx", dx, "dy", dy, "dz", dz)
+		arc.logger.Errorw("failed to apply movement step", "error", err, "delta", delta)
 	} else {
-		arc.logger.Debugf("Applied movement step: dx=%f dy=%f dz=%f", dx, dy, dz)
+		arc.logger.Debugf("Applied movement step: delta=%v", delta)
 	}
 }
 

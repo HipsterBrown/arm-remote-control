@@ -2,6 +2,7 @@ package armremotecontrol
 
 import (
 	"context"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"go.viam.com/rdk/services/motion"
 	motionbuiltin "go.viam.com/rdk/services/motion/builtin"
 	"go.viam.com/rdk/spatialmath"
+	rdkutils "go.viam.com/rdk/utils"
 )
 
 // fakeArm satisfies arm.Arm. Embedding a nil arm.Arm promotes the rest of the
@@ -172,7 +174,7 @@ func TestDirectModeSelectedWhenMotionServiceUnset(t *testing.T) {
 
 	// Behaviour unchanged: read EndPosition, add the delta, MoveToPosition.
 	fa.endPos = spatialmath.NewPose(r3.Vector{X: 1, Y: 2, Z: 3}, spatialmath.NewZeroOrientation())
-	if err := mv.step(ctx, 10, -5, 0); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 10, Y: -5, Z: 0}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step: %v", err)
 	}
 	calls := fa.getMoveCalls()
@@ -189,6 +191,96 @@ func TestDirectModeSelectedWhenMotionServiceUnset(t *testing.T) {
 	}
 	if fa.getStopCalls() != 1 {
 		t.Fatalf("expected arm.Stop to be called once, got %d", fa.getStopCalls())
+	}
+}
+
+func TestPureRotationDoesNotTranslate(t *testing.T) {
+	fa := &fakeArm{endPos: spatialmath.NewPose(
+		r3.Vector{X: 100, Y: 200, Z: 300},
+		spatialmath.NewZeroOrientation(),
+	)}
+	m := &directMover{arm: fa}
+
+	// 15 degrees of yaw, zero translation.
+	delta := spatialmath.NewPose(r3.Vector{}, &spatialmath.EulerAngles{Yaw: rdkutils.DegToRad(15)})
+	if err := m.step(context.Background(), delta); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	calls := fa.getMoveCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 MoveToPosition call, got %d", len(calls))
+	}
+	// Tolerance, not equality: Compose round-trips through dual quaternions,
+	// so an untouched 100 comes back as 99.999999999999986. That is the
+	// point being preserved, not a translation.
+	got := calls[0].Point()
+	const eps = 1e-9
+	if math.Abs(got.X-100) > eps || math.Abs(got.Y-200) > eps || math.Abs(got.Z-300) > eps {
+		t.Fatalf("a pure rotation must not move the tool: expected (100,200,300), got (%v,%v,%v)", got.X, got.Y, got.Z)
+	}
+}
+
+func TestPureTranslationDoesNotRotate(t *testing.T) {
+	start := spatialmath.NewPose(
+		r3.Vector{X: 100, Y: 200, Z: 300},
+		&spatialmath.EulerAngles{Pitch: rdkutils.DegToRad(30)},
+	)
+	fa := &fakeArm{endPos: start}
+	m := &directMover{arm: fa}
+
+	delta := spatialmath.NewPose(r3.Vector{X: 10}, spatialmath.NewZeroOrientation())
+	if err := m.step(context.Background(), delta); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	calls := fa.getMoveCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 MoveToPosition call, got %d", len(calls))
+	}
+	got := calls[0]
+	const eps = 1e-9
+	if math.Abs(got.Point().X-110) > eps {
+		t.Fatalf("expected X to advance to 110, got %v", got.Point().X)
+	}
+	if !spatialmath.OrientationAlmostEqual(got.Orientation(), start.Orientation()) {
+		t.Fatalf("a pure translation must not rotate the tool: expected orientation %v, got %v",
+			start.Orientation().OrientationVectorDegrees(), got.Orientation().OrientationVectorDegrees())
+	}
+}
+
+func TestRotationIsToolFrameNotBaseFrame(t *testing.T) {
+	startOrient := &spatialmath.EulerAngles{Yaw: rdkutils.DegToRad(90)}
+	fa := &fakeArm{endPos: spatialmath.NewPose(r3.Vector{}, startOrient)}
+	m := &directMover{arm: fa}
+
+	deltaOrient := &spatialmath.EulerAngles{Pitch: rdkutils.DegToRad(30)}
+	if err := m.step(context.Background(),
+		spatialmath.NewPose(r3.Vector{}, deltaOrient)); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+	calls := fa.getMoveCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 MoveToPosition call, got %d", len(calls))
+	}
+	got := calls[0].Orientation()
+
+	toolFrame := spatialmath.Compose(
+		spatialmath.NewPoseFromOrientation(startOrient),
+		spatialmath.NewPoseFromOrientation(deltaOrient),
+	).Orientation()
+	baseFrame := spatialmath.Compose(
+		spatialmath.NewPoseFromOrientation(deltaOrient),
+		spatialmath.NewPoseFromOrientation(startOrient),
+	).Orientation()
+
+	// Guard the test itself: if these two agreed, it would prove nothing.
+	if spatialmath.OrientationAlmostEqual(toolFrame, baseFrame) {
+		t.Fatalf("test is not discriminating: pick start/delta rotations that do not commute")
+	}
+	if !spatialmath.OrientationAlmostEqual(got, toolFrame) {
+		t.Fatalf("expected tool-frame composition %v, got %v",
+			toolFrame.OrientationVectorDegrees(), got.OrientationVectorDegrees())
 	}
 }
 
@@ -237,11 +329,85 @@ func TestTeleopModeIssuesStartOnceWithComponentNameAndReferenceFrame(t *testing.
 	if req.GetDestination().GetReferenceFrame() != "gripper-1" {
 		t.Fatalf("expected destination.reference_frame gripper-1, got %q", req.GetDestination().GetReferenceFrame())
 	}
+
+	// deltaPoseInFrame now computes this from NewZeroPose rather than
+	// hardcoding OZ:1 -- pin the wire identity.
+	if p := req.GetDestination().GetPose(); p.GetX() != 0 || p.GetY() != 0 || p.GetZ() != 0 ||
+		p.GetOX() != 0 || p.GetOY() != 0 || p.GetOZ() != 1 || p.GetTheta() != 0 {
+		t.Fatalf("expected an identity zero destination pose, got %+v", p)
+	}
 }
 
-// A 5-DoF arm cannot hold its tool orientation through a sideways move, so
-// the teleop goal must be position-only or X/Y deltas yield zero IK solutions.
-func TestTeleopStartRequestsPositionOnlyGoal(t *testing.T) {
+// position_only zeroes the orientation weight in the planner's goal metric,
+// so it must be opt-in: on by default would silently discard every rotation
+// command. It stays available as an escape hatch for arms with fewer than
+// six DoF, which cannot hold an orientation through a sideways move.
+func TestTeleopStartOmitsPositionOnlyByDefault(t *testing.T) {
+	fa := &fakeArm{}
+	fms := &fakeMotionService{handler: healthyStatusHandler()}
+	ctx := context.Background()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	if _, err := newTeleopMover(ctx, fms, fa, "arm-1", newTestLogger(t), cancelCtx, &wg, false); err != nil {
+		t.Fatalf("newTeleopMover: %v", err)
+	}
+	cancel() // explicit, not deferred -- see TestTeleopMoveCarriesOrientation
+
+	calls := fms.callsFor(motionbuiltin.DoTeleopStart)
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(calls))
+	}
+	payload, ok := calls[0][motionbuiltin.DoTeleopStart].(string)
+	if !ok {
+		t.Fatalf("teleop_start value is not a string: %#v", calls[0][motionbuiltin.DoTeleopStart])
+	}
+	req := unaryMoveRequest(t, payload)
+	// (*structpb.Struct).AsMap() is nil-safe, so no separate req.Extra != nil
+	// guard is needed here.
+	if _, ok := req.Extra.AsMap()["goal_metric_type"]; ok {
+		t.Fatalf("expected no goal_metric_type by default: it makes the planner ignore orientation")
+	}
+}
+
+func TestTeleopStartRequestsPositionOnlyWhenConfigured(t *testing.T) {
+	fa := &fakeArm{}
+	fms := &fakeMotionService{handler: healthyStatusHandler()}
+	ctx := context.Background()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	if _, err := newTeleopMover(ctx, fms, fa, "arm-1", newTestLogger(t), cancelCtx, &wg, true); err != nil {
+		t.Fatalf("newTeleopMover: %v", err)
+	}
+	cancel() // explicit, not deferred -- see TestTeleopMoveCarriesOrientation
+
+	calls := fms.callsFor(motionbuiltin.DoTeleopStart)
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(calls))
+	}
+	payload, ok := calls[0][motionbuiltin.DoTeleopStart].(string)
+	if !ok {
+		t.Fatalf("teleop_start value is not a string: %#v", calls[0][motionbuiltin.DoTeleopStart])
+	}
+	req := unaryMoveRequest(t, payload)
+	if req.Extra.AsMap()["goal_metric_type"] != "position_only" {
+		t.Fatalf("expected goal_metric_type=position_only when configured, got %v", req.Extra)
+	}
+}
+
+// TestConfigPositionOnlyReachesTeleopStart covers the attribute-to-wire path
+// that TestTeleopStartRequestsPositionOnlyWhenConfigured does not: it builds
+// through newMover with a real *Config, the same route the JSON
+// position_only attribute actually takes, instead of calling
+// newTeleopMover directly with a literal bool. Without this, a regression
+// that stops newMover from threading conf.PositionOnly through would leave
+// all other tests passing while the attribute silently did nothing.
+func TestConfigPositionOnlyReachesTeleopStart(t *testing.T) {
 	fa := &fakeArm{}
 	fms := &fakeMotionService{handler: healthyStatusHandler()}
 	logger := newTestLogger(t)
@@ -252,25 +418,24 @@ func TestTeleopStartRequestsPositionOnlyGoal(t *testing.T) {
 	defer wg.Wait()
 
 	deps := resource.Dependencies{motion.Named("motion-1"): fms}
-	conf := &Config{ArmName: "arm-1", MotionServiceName: "motion-1", ReferenceFrame: "gripper-1"}
+	conf := &Config{ArmName: "arm-1", MotionServiceName: "motion-1", PositionOnly: true}
 
 	if _, err := newMover(ctx, deps, conf, fa, logger, cancelCtx, &wg); err != nil {
 		t.Fatalf("newMover: %v", err)
 	}
 	cancel()
 
-	startCalls := fms.callsFor(motionbuiltin.DoTeleopStart)
-	if len(startCalls) != 1 {
-		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(startCalls))
+	calls := fms.callsFor(motionbuiltin.DoTeleopStart)
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(calls))
 	}
-	payload, ok := startCalls[0][motionbuiltin.DoTeleopStart].(string)
+	payload, ok := calls[0][motionbuiltin.DoTeleopStart].(string)
 	if !ok {
-		t.Fatalf("teleop_start value is not a string: %#v", startCalls[0][motionbuiltin.DoTeleopStart])
+		t.Fatalf("teleop_start value is not a string: %#v", calls[0][motionbuiltin.DoTeleopStart])
 	}
-
 	req := unaryMoveRequest(t, payload)
-	if got := req.GetExtra().AsMap()["goal_metric_type"]; got != "position_only" {
-		t.Fatalf("goal_metric_type = %v, want \"position_only\"", got)
+	if req.Extra.AsMap()["goal_metric_type"] != "position_only" {
+		t.Fatalf("expected goal_metric_type=position_only from a Config.PositionOnly=true, got %v", req.Extra)
 	}
 }
 
@@ -293,7 +458,7 @@ func TestStepEmitsTeleopMoveWithDeltaAndTopLevelComponentName(t *testing.T) {
 	}
 	cancel()
 
-	if err := mv.step(ctx, 0, 0, 10); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 0, Y: 0, Z: 10}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step: %v", err)
 	}
 
@@ -345,10 +510,10 @@ func TestStepDeltasAreRelativeNotAccumulating(t *testing.T) {
 	}
 	cancel()
 
-	if err := mv.step(ctx, 5, 0, 0); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 5, Y: 0, Z: 0}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step 1: %v", err)
 	}
-	if err := mv.step(ctx, 5, 0, 0); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 5, Y: 0, Z: 0}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step 2: %v", err)
 	}
 
@@ -363,6 +528,67 @@ func TestStepDeltasAreRelativeNotAccumulating(t *testing.T) {
 	if pif1.GetPose().GetX() != 5 || pif2.GetPose().GetX() != 5 {
 		t.Fatalf("expected both steps to carry delta x=5 (not accumulating), got %v then %v",
 			pif1.GetPose().GetX(), pif2.GetPose().GetX())
+	}
+}
+
+func TestTeleopMoveCarriesOrientation(t *testing.T) {
+	fa := &fakeArm{}
+	fms := &fakeMotionService{handler: healthyStatusHandler()}
+	logger := newTestLogger(t)
+	ctx := context.Background()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	tm, err := newTeleopMover(ctx, fms, fa, "gripper-1", logger, cancelCtx, &wg, false)
+	if err != nil {
+		t.Fatalf("newTeleopMover: %v", err)
+	}
+	// Explicit, not deferred. Defers are LIFO, so the deferred wg.Wait()
+	// above would run BEFORE a deferred cancel() and block forever on the
+	// pollStatus goroutine, which only exits on cancelCtx.Done().
+	cancel()
+
+	delta := spatialmath.NewPose(
+		r3.Vector{X: 5},
+		&spatialmath.EulerAngles{Roll: rdkutils.DegToRad(10)},
+	)
+	if err := tm.step(ctx, delta); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	calls := fms.callsFor(motionbuiltin.DoTeleopMove)
+	if len(calls) < 1 {
+		t.Fatalf("expected at least 1 teleop_move call, got %d", len(calls))
+	}
+	last := calls[len(calls)-1]
+	pif := unaryPoseInFrame(t, last[motionbuiltin.DoTeleopMove].(string))
+
+	want := delta.Orientation().OrientationVectorDegrees()
+	got := pif.Pose
+	// A 10-degree roll gives a non-zero OV theta; a different axis may not,
+	// so this check is a proxy for "not the identity orientation" and not a
+	// general non-identity test.
+	if got.Theta == 0 {
+		t.Fatalf("expected a non-zero theta for a 10-degree roll, got the identity orientation")
+	}
+	const eps = 1e-6
+	if math.Abs(got.OX-want.OX) > eps || math.Abs(got.OY-want.OY) > eps ||
+		math.Abs(got.OZ-want.OZ) > eps || math.Abs(got.Theta-want.Theta) > eps {
+		t.Fatalf("expected ov (%v,%v,%v,%v), got (%v,%v,%v,%v)",
+			want.OX, want.OY, want.OZ, want.Theta, got.OX, got.OY, got.OZ, got.Theta)
+	}
+	// No Compose is involved here (that's directMover's path, not teleopMover's),
+	// but spatialmath.NewPose still encodes the point through the rotation
+	// quaternion (spatialmath/pose.go's NewPose sets q.Real to the
+	// orientation before SetTranslation), and decoding it back via Point()
+	// is lossy for a general rotation. It happens to round-trip exactly for
+	// this roll-about-X delta, but that's incidental to the axis and angle
+	// chosen, not a property of the code path -- so this uses the same
+	// tolerance as the OV assertion above rather than an exact compare.
+	if math.Abs(got.X-5) > eps {
+		t.Fatalf("expected the translation to survive alongside the rotation, got X=%v", got.X)
 	}
 }
 
@@ -477,7 +703,7 @@ func TestStatusErrorDuringOperationLogsAndDoesNotSwitchModes(t *testing.T) {
 	if _, ok := mv.(*teleopMover); !ok {
 		t.Fatalf("expected mover to remain *teleopMover after failures, got %T", mv)
 	}
-	if err := mv.step(ctx, 1, 0, 0); err != nil {
+	if err := mv.step(ctx, spatialmath.NewPose(r3.Vector{X: 1, Y: 0, Z: 0}, spatialmath.NewZeroOrientation())); err != nil {
 		t.Fatalf("step: %v", err)
 	}
 	if len(fa.getMoveCalls()) != 0 {
@@ -599,14 +825,14 @@ func TestButtonPressedAcceptsHold(t *testing.T) {
 // real mover.
 type fakeMover struct {
 	mu        sync.Mutex
-	stepCalls [][3]float64
+	stepCalls []spatialmath.Pose
 	stopCalls int
 }
 
-func (f *fakeMover) step(ctx context.Context, dx, dy, dz float64) error {
+func (f *fakeMover) step(ctx context.Context, delta spatialmath.Pose) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.stepCalls = append(f.stepCalls, [3]float64{dx, dy, dz})
+	f.stepCalls = append(f.stepCalls, delta)
 	return nil
 }
 
@@ -617,10 +843,10 @@ func (f *fakeMover) stop(ctx context.Context) error {
 	return nil
 }
 
-func (f *fakeMover) steps() [][3]float64 {
+func (f *fakeMover) steps() []spatialmath.Pose {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([][3]float64, len(f.stepCalls))
+	out := make([]spatialmath.Pose, len(f.stepCalls))
 	copy(out, f.stepCalls)
 	return out
 }
@@ -641,33 +867,34 @@ func (f *fakeMover) stops() int {
 func newTestGamepad(t *testing.T, mv mover) *armRemoteControlGamepad {
 	t.Helper()
 	return &armRemoteControlGamepad{
-		mover:          mv,
-		logger:         newTestLogger(t),
-		stepSize:       10.0,
-		initialized:    true,
-		connected:      true,
-		analogTriggers: true,
-		requireEnable:  true,
-		cancelCtx:      context.Background(),
+		mover:            mv,
+		logger:           newTestLogger(t),
+		stepSize:         10.0,
+		rotationStepSize: defaultRotationStepSize,
+		initialized:      true,
+		connected:        true,
+		analogTriggers:   true,
+		requireEnable:    true,
+		cancelCtx:        context.Background(),
 	}
 }
 
-func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
+func TestTickAppliesStickAndButtonDeltas(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
-		input.AbsoluteRZ:    {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:   {Event: input.ButtonPress},
+		input.AbsoluteX:  {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	steps := mv.steps()
 	if len(steps) != 1 {
 		t.Fatalf("expected 1 step call, got %d", len(steps))
 	}
-	if steps[0] != [3]float64{10, 0, 10} {
-		t.Fatalf("expected delta (10,0,10), got %v", steps[0])
+	if got := steps[0].Point(); got.X != 10 || got.Y != 0 || got.Z != 10 {
+		t.Fatalf("expected delta point (10,0,10), got %v", got)
 	}
 }
 
@@ -681,7 +908,7 @@ func TestZComesFromAnalogTriggers(t *testing.T) {
 	}, time.Now())
 
 	steps := mv.steps()
-	if len(steps) != 1 || steps[0][2] != 10.0 {
+	if len(steps) != 1 || steps[0].Point().Z != 10.0 {
 		t.Fatalf("expected dz=10 from a fully pressed right trigger, got %v", steps)
 	}
 }
@@ -710,7 +937,7 @@ func TestTriggersAreProportional(t *testing.T) {
 		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 0.5},
 	}, time.Now())
 
-	if steps := mv.steps(); len(steps) != 1 || steps[0][2] != 5.0 {
+	if steps := mv.steps(); len(steps) != 1 || steps[0].Point().Z != 5.0 {
 		t.Fatalf("expected dz=5 at half deflection, got %v", steps)
 	}
 }
@@ -766,8 +993,148 @@ func TestZFallsBackToDigitalTriggers(t *testing.T) {
 		input.ButtonRT2: {Event: input.ButtonPress},
 	}, time.Now())
 
-	if steps := mv.steps(); len(steps) != 1 || steps[0][2] != 10.0 {
+	if steps := mv.steps(); len(steps) != 1 || steps[0].Point().Z != 10.0 {
 		t.Fatalf("expected dz=10 from the digital right trigger, got %v", steps)
+	}
+}
+
+func TestLeftStickDrivesTranslation(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.rotationStepSize = 2.0
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteY: {Event: input.PositionChangeAbs, Value: -0.5},
+	}, time.Now())
+
+	steps := mv.steps()
+	if len(steps) != 1 {
+		t.Fatalf("expected 1 step, got %d", len(steps))
+	}
+	got := steps[0].Point()
+	if got.X != 10.0 || got.Y != -5.0 {
+		t.Fatalf("expected proportional translation (10,-5), got (%v,%v)", got.X, got.Y)
+	}
+}
+
+func TestRightStickDrivesRotation(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.rotationStepSize = 10.0
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
+		input.AbsoluteRX: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	steps := mv.steps()
+	if len(steps) != 1 {
+		t.Fatalf("expected 1 step, got %d", len(steps))
+	}
+	if pt := steps[0].Point(); pt.X != 0 || pt.Y != 0 || pt.Z != 0 {
+		t.Fatalf("stick rotation must not translate, got %v", pt)
+	}
+	if ov := steps[0].Orientation().OrientationVectorDegrees(); ov.Theta == 0 {
+		t.Fatalf("expected a non-zero rotation from full right-stick deflection")
+	}
+}
+
+func TestDegreesReachRadians(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.rotationStepSize = 90.0
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	// 90 degrees, not 90 radians. A missing DegToRad gives ~5157 degrees,
+	// which wraps to something nowhere near a quarter turn.
+	want := &spatialmath.EulerAngles{Roll: rdkutils.DegToRad(90)}
+	if !spatialmath.OrientationAlmostEqual(mv.steps()[0].Orientation(), want) {
+		t.Fatalf("expected a 90-degree roll; the degrees-to-radians conversion is missing or wrong")
+	}
+}
+
+func TestFineSpeedScalesBothTranslationAndRotation(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.rotationStepSize = 40.0
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.ButtonRT:      {Event: input.ButtonPress}, // fine speed
+		input.AbsoluteX:     {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	step := mv.steps()[0]
+	if got := step.Point().X; got != 2.5 {
+		t.Fatalf("expected fine speed to quarter translation to 2.5, got %v", got)
+	}
+	want := &spatialmath.EulerAngles{Roll: rdkutils.DegToRad(10)} // 40 * 0.25
+	if !spatialmath.OrientationAlmostEqual(step.Orientation(), want) {
+		t.Fatalf("expected fine speed to quarter rotation to 10 degrees")
+	}
+}
+
+func TestCombinedTranslationAndRotationDelta(t *testing.T) {
+	// The case an operator produces constantly -- stick deflected AND wrist
+	// twisting -- and the one no Task 2 test covered, because until this task
+	// rotation was never wired to a control, so a combined delta was
+	// unreachable from tick. It is reachable now.
+	//
+	// The property: the translation component must land in the ARM frame --
+	// exactly where translation alone would put it -- and must NOT be rotated
+	// by the delta's own rotation. A naive monolithic Compose(current, delta)
+	// is off by ~5.2mm on this test's own numbers -- it produces
+	// (108.66, 195, 295) against the expected (110, 195, 300). The error
+	// scales with the per-tick delta (max ~17mm at step_size 10), not with
+	// the arm's position.
+	start := spatialmath.NewPose(
+		r3.Vector{X: 100, Y: 200, Z: 300},
+		&spatialmath.EulerAngles{Pitch: rdkutils.DegToRad(30)},
+	)
+	fa := &fakeArm{endPos: start}
+	m := &directMover{arm: fa}
+
+	delta := spatialmath.NewPose(
+		r3.Vector{X: 10, Y: -5, Z: 0},
+		&spatialmath.EulerAngles{Yaw: rdkutils.DegToRad(15)},
+	)
+	if err := m.step(context.Background(), delta); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	got := fa.getMoveCalls()[0]
+	const eps = 1e-9
+	if math.Abs(got.Point().X-110) > eps || math.Abs(got.Point().Y-195) > eps ||
+		math.Abs(got.Point().Z-300) > eps {
+		t.Fatalf("translation must stay in the arm frame: expected (110,195,300), got %v", got.Point())
+	}
+
+	want := spatialmath.Compose(
+		spatialmath.NewPoseFromOrientation(start.Orientation()),
+		spatialmath.NewPoseFromOrientation(delta.Orientation()),
+	).Orientation()
+	if !spatialmath.OrientationAlmostEqual(got.Orientation(), want) {
+		t.Fatalf("expected tool-frame rotation alongside arm-frame translation")
+	}
+}
+
+func TestZeroDeltaSkipsTheTick(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT: {Event: input.ButtonPress},
+	}, time.Now())
+
+	if len(mv.steps()) != 0 {
+		t.Fatalf("expected a zero delta to issue no step, got %v", mv.steps())
 	}
 }
 
@@ -776,7 +1143,7 @@ func TestDeadmanBlocksMotionWhenNotHeld(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	if len(mv.steps()) != 0 {
@@ -795,8 +1162,8 @@ func TestDeadmanAllowsMotionWhenHeld(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	if len(mv.steps()) != 1 {
@@ -809,12 +1176,12 @@ func TestDeadmanReleaseStopsExactlyOnce(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	held := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 	released := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonRelease},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonRelease},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 
 	arc.tick(context.Background(), held, time.Now())
@@ -845,8 +1212,8 @@ func TestDeadmanReleaseStopsAfterAnIdleTick(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	moving := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 	idle := map[input.Control]input.Event{
 		input.ButtonLT: {Event: input.ButtonHold},
@@ -870,7 +1237,7 @@ func TestDeadmanCanBeDisabled(t *testing.T) {
 	arc.requireEnable = false
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	if len(mv.steps()) != 1 {
@@ -938,6 +1305,18 @@ func TestExplicitSafetyFieldsAreHonoured(t *testing.T) {
 	}
 }
 
+func TestRotationStepSizeDefaults(t *testing.T) {
+	if got := resolveRotationStepSize(&Config{}); got != defaultRotationStepSize {
+		t.Fatalf("expected rotation_step_size to default to %v, got %v", defaultRotationStepSize, got)
+	}
+	if got := resolveRotationStepSize(&Config{RotationStepSize: 5.0}); got != 5.0 {
+		t.Fatalf("expected an explicit rotation_step_size to be honoured, got %v", got)
+	}
+	if got := resolveRotationStepSize(&Config{RotationStepSize: -1}); got != defaultRotationStepSize {
+		t.Fatalf("expected a negative rotation_step_size to fall back to the default, got %v", got)
+	}
+}
+
 func TestValidateAddsGripperDependencyWhenSet(t *testing.T) {
 	deps, _, err := (&Config{
 		ArmName:             "arm-1",
@@ -998,8 +1377,8 @@ func TestEStopLatchesAndBlocksMotion(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	moving := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 
 	arc.tick(context.Background(), moving, time.Now())
@@ -1038,8 +1417,8 @@ func TestEStopClearsOnStart(t *testing.T) {
 	}, time.Now())
 
 	moving := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 	arc.tick(context.Background(), moving, time.Now())
 
@@ -1068,8 +1447,8 @@ func TestDeadOperatorTimerStopsFrozenController(t *testing.T) {
 
 	start := time.Now()
 	frozen := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonLT:  {Event: input.ButtonPress, Time: start},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
 	}
 
 	arc.tick(context.Background(), frozen, start)
@@ -1098,8 +1477,8 @@ func TestDeadOperatorTimerStopsFrozenController(t *testing.T) {
 	// its own trip condition -- so pin that a tick with genuinely fresh
 	// event timestamps lets motion through again.
 	recovered := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start.Add(10 * time.Second)},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(10 * time.Second)},
+		input.ButtonLT:  {Event: input.ButtonPress, Time: start.Add(10 * time.Second)},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(10 * time.Second)},
 	}
 	arc.tick(context.Background(), recovered, start.Add(10*time.Second))
 
@@ -1117,8 +1496,8 @@ func TestDeadOperatorTimerResetsOnFreshEvents(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		at := start.Add(time.Duration(i) * 500 * time.Millisecond)
 		arc.tick(context.Background(), map[input.Control]input.Event{
-			input.ButtonLT:      {Event: input.ButtonPress, Time: at},
-			input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: at},
+			input.ButtonLT:  {Event: input.ButtonPress, Time: at},
+			input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: at},
 		}, at)
 	}
 
@@ -1144,8 +1523,8 @@ func TestIdleTicksClearTheRunTimer(t *testing.T) {
 	at := func(d time.Duration) time.Time { return start.Add(d) }
 	moving := func(d time.Duration) map[input.Control]input.Event {
 		return map[input.Control]input.Event{
-			input.ButtonLT:      {Event: input.ButtonPress, Time: at(d)},
-			input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: at(d)},
+			input.ButtonLT:  {Event: input.ButtonPress, Time: at(d)},
+			input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: at(d)},
 		}
 	}
 	resting := func(d time.Duration) map[input.Control]input.Event {
@@ -1174,8 +1553,8 @@ func TestDeadOperatorTimerCanBeDisabled(t *testing.T) {
 
 	start := time.Now()
 	frozen := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonLT:  {Event: input.ButtonPress, Time: start},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
 	}
 
 	arc.tick(context.Background(), frozen, start)
@@ -1202,8 +1581,8 @@ func TestDeadOperatorTimerUsesHostClockNotControllerClock(t *testing.T) {
 	// The controller's own clock reports timestamps an hour ahead of the
 	// host's -- e.g. a modular/remote controller with clock drift.
 	aheadOfHost := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start.Add(time.Hour)},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(time.Hour)},
+		input.ButtonLT:  {Event: input.ButtonPress, Time: start.Add(time.Hour)},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(time.Hour)},
 	}
 
 	arc.tick(context.Background(), aheadOfHost, start)
@@ -1311,8 +1690,8 @@ func TestGripperDoesNotBlockTheMovementLoop(t *testing.T) {
 
 	// The loop must keep servicing motion while the gripper is stuck.
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	if len(mv.steps()) != 1 {
@@ -1524,9 +1903,9 @@ func TestGripperDispatchGatedByDeadOperatorTimer(t *testing.T) {
 
 	start := time.Now()
 	frozen := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
-		input.ButtonSouth:   {Event: input.ButtonPress, Time: start},
+		input.ButtonLT:    {Event: input.ButtonPress, Time: start},
+		input.AbsoluteX:   {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonSouth: {Event: input.ButtonPress, Time: start},
 	}
 
 	for i := 0; i < 11; i++ {
