@@ -1054,3 +1054,112 @@ func TestEStopButtonAlsoLatches(t *testing.T) {
 		t.Fatalf("expected input.ButtonEStop to latch the E-stop")
 	}
 }
+
+func TestDeadOperatorTimerStopsFrozenController(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	frozen := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+	}
+
+	arc.tick(context.Background(), frozen, start)
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion at the start, got %v", mv.steps())
+	}
+
+	// Two seconds later the events have not advanced at all.
+	arc.tick(context.Background(), frozen, start.Add(2*time.Second))
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected the timer to suppress further motion, got %v", mv.steps())
+	}
+	if mv.stops() != 1 {
+		t.Fatalf("expected the timer to stop the mover once, got %d", mv.stops())
+	}
+}
+
+func TestDeadOperatorTimerResetsOnFreshEvents(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		at := start.Add(time.Duration(i) * 500 * time.Millisecond)
+		arc.tick(context.Background(), map[input.Control]input.Event{
+			input.ButtonLT:      {Event: input.ButtonPress, Time: at},
+			input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: at},
+		}, at)
+	}
+
+	if len(mv.steps()) != 5 {
+		t.Fatalf("expected all 5 ticks to move while events keep advancing, got %v", mv.steps())
+	}
+}
+
+func TestIdleTicksClearTheRunTimer(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+	arc.maxContinuousMotion = time.Second
+
+	start := time.Now()
+	// Event timestamps advance with each tick. This matters: a real operator
+	// centring a stick emits a fresh event, so lastEventAt advances and the
+	// dead-operator timer never trips. A fixture that freezes Time at `start`
+	// instead simulates a *dead controller*, which correctly DOES trip the
+	// timer -- and would make this test fail for the right reason about the
+	// wrong scenario. Do not "fix" such a failure by making haltMotion clear
+	// motionSince; that re-conflates the run timer with the stop latch and
+	// reintroduces the sawtooth documented in the spec.
+	at := func(d time.Duration) time.Time { return start.Add(d) }
+	moving := func(d time.Duration) map[input.Control]input.Event {
+		return map[input.Control]input.Event{
+			input.ButtonLT:      {Event: input.ButtonPress, Time: at(d)},
+			input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: at(d)},
+		}
+	}
+	resting := func(d time.Duration) map[input.Control]input.Event {
+		return map[input.Control]input.Event{
+			input.ButtonLT: {Event: input.ButtonPress, Time: at(d)},
+		}
+	}
+
+	arc.tick(context.Background(), moving(0), at(0))
+	// Operator rests on the deadman for well over the timeout, but keeps
+	// producing events -- the controller is alive, the hand is just still.
+	arc.tick(context.Background(), resting(2*time.Second), at(2*time.Second))
+	arc.tick(context.Background(), resting(4*time.Second), at(4*time.Second))
+	// ...then moves again. Resting must not have tripped the timer.
+	arc.tick(context.Background(), moving(5*time.Second), at(5*time.Second))
+
+	if len(mv.steps()) != 2 {
+		t.Fatalf("expected resting not to trip the timer; got %v", mv.steps())
+	}
+}
+
+func TestDeadOperatorTimerCanBeDisabled(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+	arc.maxContinuousMotion = 0
+
+	start := time.Now()
+	frozen := map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+	}
+
+	arc.tick(context.Background(), frozen, start)
+	arc.tick(context.Background(), frozen, start.Add(time.Hour))
+
+	if len(mv.steps()) != 2 {
+		t.Fatalf("expected a disabled timer never to suppress motion, got %v", mv.steps())
+	}
+}

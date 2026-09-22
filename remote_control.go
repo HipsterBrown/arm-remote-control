@@ -556,6 +556,10 @@ type armRemoteControlGamepad struct {
 	motionSince time.Time
 	needsStop   bool
 
+	// lastEventAt is the newest Event.Time seen across all controls.
+	// Loop-owned; see the dead-operator timer.
+	lastEventAt time.Time
+
 	activeBackgroundWorkers sync.WaitGroup
 }
 
@@ -699,6 +703,20 @@ func controllerGone(events map[input.Control]input.Event) bool {
 	return false
 }
 
+// newestEvent returns the most recent timestamp across all controls. Note
+// this is deliberately not per-control: a held button emits one event and
+// then nothing, so its own timestamp is stale by design. Only the controller
+// as a whole going silent is a signal.
+func newestEvent(events map[input.Control]input.Event) time.Time {
+	var newest time.Time
+	for _, e := range events {
+		if e.Time.After(newest) {
+			newest = e.Time
+		}
+	}
+	return newest
+}
+
 // continuousMovementProcessor is the movement loop: it drives a 10Hz ticker,
 // reads the controller's current state each tick, and delegates to tick.
 //
@@ -798,12 +816,32 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 
 	// Gates run most authoritative first (see
 	// docs/SPEC-teleop-safety-gripper.md "Gating order"): controller gone,
-	// then the E-stop gates above, then this deadman gate. Task 7's
-	// dead-operator timer is subordinate to the deadman and belongs
-	// immediately BELOW it. Insert new gates by authority, not convenience.
+	// then the E-stop gates, then initialized, then the deadman, then the
+	// dead-operator timer, and only then the delta. Insert new gates by
+	// authority, not convenience.
 	if arc.requireEnable && !buttonPressed(events, input.ButtonLT) {
 		// Releasing the deadman ends the run, same as an idle tick.
 		arc.motionSince = time.Time{}
+		arc.haltMotion(ctx)
+		return
+	}
+
+	if at := newestEvent(events); at.After(arc.lastEventAt) {
+		arc.lastEventAt = at
+	}
+
+	// Dead-operator timer: motion has been commanded continuously, and
+	// nothing on the controller has changed in that whole window. Do not
+	// clear motionSince here -- see haltMotion's doc and the spec's
+	// dead-operator section: clearing it would un-latch this gate's own
+	// condition and produce a step/stop sawtooth against a vanished
+	// controller.
+	if arc.maxContinuousMotion > 0 && !arc.motionSince.IsZero() &&
+		now.Sub(arc.lastEventAt) > arc.maxContinuousMotion {
+		arc.logger.Warnf(
+			"no controller activity for %v while commanding motion; stopping",
+			now.Sub(arc.lastEventAt),
+		)
 		arc.haltMotion(ctx)
 		return
 	}
@@ -861,6 +899,12 @@ func (arc *armRemoteControlGamepad) haltMotion(ctx context.Context) {
 	if !arc.needsStop {
 		return
 	}
+	// needsStop clears before the call, not after, so a failed mover.stop is
+	// not retried on the next tick -- considered, not missed: the
+	// alternative is leaving needsStop set on error, which retries at 10Hz
+	// against a mover that just failed to stop, and in teleop mode that
+	// means hammering pipeline teardown/re-establish on every tick. The
+	// error is still logged, and any subsequent step re-arms needsStop.
 	arc.needsStop = false
 	if err := arc.mover.stop(ctx); err != nil {
 		arc.logger.Errorw("failed to stop motion", "error", err)
