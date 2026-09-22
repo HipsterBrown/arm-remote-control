@@ -81,6 +81,12 @@ type Config struct {
 	// six DOF, which cannot hold an orientation while translating -- but it
 	// also makes the planner IGNORE goal orientation, so the rotation
 	// controls become inert. Teleop mode only.
+	//
+	// A plain bool, not a pointer, is correct here -- unlike RequireEnable
+	// and MaxContinuousMotion above -- because the zero value false is the
+	// intended default: there is no third state to distinguish, and false
+	// is the conservative direction (more constrained planning, which fails
+	// to plan rather than moving with drifting orientation).
 	PositionOnly bool `json:"position_only,omitempty"`
 }
 

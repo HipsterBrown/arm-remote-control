@@ -357,11 +357,18 @@ func TestTeleopStartOmitsPositionOnlyByDefault(t *testing.T) {
 	cancel() // explicit, not deferred -- see TestTeleopMoveCarriesOrientation
 
 	calls := fms.callsFor(motionbuiltin.DoTeleopStart)
-	req := unaryMoveRequest(t, calls[0][motionbuiltin.DoTeleopStart].(string))
-	if req.Extra != nil {
-		if _, ok := req.Extra.AsMap()["goal_metric_type"]; ok {
-			t.Fatalf("expected no goal_metric_type by default: it makes the planner ignore orientation")
-		}
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(calls))
+	}
+	payload, ok := calls[0][motionbuiltin.DoTeleopStart].(string)
+	if !ok {
+		t.Fatalf("teleop_start value is not a string: %#v", calls[0][motionbuiltin.DoTeleopStart])
+	}
+	req := unaryMoveRequest(t, payload)
+	// (*structpb.Struct).AsMap() is nil-safe, so no separate req.Extra != nil
+	// guard is needed here.
+	if _, ok := req.Extra.AsMap()["goal_metric_type"]; ok {
+		t.Fatalf("expected no goal_metric_type by default: it makes the planner ignore orientation")
 	}
 }
 
@@ -380,9 +387,55 @@ func TestTeleopStartRequestsPositionOnlyWhenConfigured(t *testing.T) {
 	cancel() // explicit, not deferred -- see TestTeleopMoveCarriesOrientation
 
 	calls := fms.callsFor(motionbuiltin.DoTeleopStart)
-	req := unaryMoveRequest(t, calls[0][motionbuiltin.DoTeleopStart].(string))
-	if req.Extra == nil || req.Extra.AsMap()["goal_metric_type"] != "position_only" {
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(calls))
+	}
+	payload, ok := calls[0][motionbuiltin.DoTeleopStart].(string)
+	if !ok {
+		t.Fatalf("teleop_start value is not a string: %#v", calls[0][motionbuiltin.DoTeleopStart])
+	}
+	req := unaryMoveRequest(t, payload)
+	if req.Extra.AsMap()["goal_metric_type"] != "position_only" {
 		t.Fatalf("expected goal_metric_type=position_only when configured, got %v", req.Extra)
+	}
+}
+
+// TestConfigPositionOnlyReachesTeleopStart covers the attribute-to-wire path
+// that TestTeleopStartRequestsPositionOnlyWhenConfigured does not: it builds
+// through newMover with a real *Config, the same route the JSON
+// position_only attribute actually takes, instead of calling
+// newTeleopMover directly with a literal bool. Without this, a regression
+// that stops newMover from threading conf.PositionOnly through would leave
+// all other tests passing while the attribute silently did nothing.
+func TestConfigPositionOnlyReachesTeleopStart(t *testing.T) {
+	fa := &fakeArm{}
+	fms := &fakeMotionService{handler: healthyStatusHandler()}
+	logger := newTestLogger(t)
+	ctx := context.Background()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	deps := resource.Dependencies{motion.Named("motion-1"): fms}
+	conf := &Config{ArmName: "arm-1", MotionServiceName: "motion-1", PositionOnly: true}
+
+	if _, err := newMover(ctx, deps, conf, fa, logger, cancelCtx, &wg); err != nil {
+		t.Fatalf("newMover: %v", err)
+	}
+	cancel()
+
+	calls := fms.callsFor(motionbuiltin.DoTeleopStart)
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(calls))
+	}
+	payload, ok := calls[0][motionbuiltin.DoTeleopStart].(string)
+	if !ok {
+		t.Fatalf("teleop_start value is not a string: %#v", calls[0][motionbuiltin.DoTeleopStart])
+	}
+	req := unaryMoveRequest(t, payload)
+	if req.Extra.AsMap()["goal_metric_type"] != "position_only" {
+		t.Fatalf("expected goal_metric_type=position_only from a Config.PositionOnly=true, got %v", req.Extra)
 	}
 }
 
@@ -526,9 +579,15 @@ func TestTeleopMoveCarriesOrientation(t *testing.T) {
 		t.Fatalf("expected ov (%v,%v,%v,%v), got (%v,%v,%v,%v)",
 			want.OX, want.OY, want.OZ, want.Theta, got.OX, got.OY, got.OZ, got.Theta)
 	}
-	// Exact compare: X=5 is a pass-through of the delta's translation, not
-	// arithmetic through Compose, so it has no rounding to tolerate.
-	if got.X != 5 {
+	// No Compose is involved here (that's directMover's path, not teleopMover's),
+	// but spatialmath.NewPose still encodes the point through the rotation
+	// quaternion (spatialmath/pose.go's NewPose sets q.Real to the
+	// orientation before SetTranslation), and decoding it back via Point()
+	// is lossy for a general rotation. It happens to round-trip exactly for
+	// this roll-about-X delta, but that's incidental to the axis and angle
+	// chosen, not a property of the code path -- so this uses the same
+	// tolerance as the OV assertion above rather than an exact compare.
+	if math.Abs(got.X-5) > eps {
 		t.Fatalf("expected the translation to survive alongside the rotation, got X=%v", got.X)
 	}
 }
