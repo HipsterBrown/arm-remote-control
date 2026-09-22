@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"go.viam.com/rdk/components/arm"
+	"go.viam.com/rdk/components/gripper"
 	"go.viam.com/rdk/components/input"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
@@ -1183,4 +1184,151 @@ func TestDeadOperatorTimerCanBeDisabled(t *testing.T) {
 	if len(mv.steps()) != 2 {
 		t.Fatalf("expected a disabled timer never to suppress motion, got %v", mv.steps())
 	}
+}
+
+// fakeGripper satisfies gripper.Gripper. block, when non-nil, holds Grab and
+// Open until closed, standing in for slow hardware.
+type fakeGripper struct {
+	gripper.Gripper
+
+	block chan struct{}
+
+	mu        sync.Mutex
+	grabCalls int
+	openCalls int
+	stopCalls int
+}
+
+func (f *fakeGripper) Grab(ctx context.Context, extra map[string]interface{}) (bool, error) {
+	f.mu.Lock()
+	f.grabCalls++
+	f.mu.Unlock()
+	if f.block != nil {
+		<-f.block
+	}
+	return true, nil
+}
+
+func (f *fakeGripper) Open(ctx context.Context, extra map[string]interface{}) error {
+	f.mu.Lock()
+	f.openCalls++
+	f.mu.Unlock()
+	if f.block != nil {
+		<-f.block
+	}
+	return nil
+}
+
+func (f *fakeGripper) Stop(ctx context.Context, extra map[string]interface{}) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopCalls++
+	return nil
+}
+
+func (f *fakeGripper) counts() (grab, open, stop int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.grabCalls, f.openCalls, f.stopCalls
+}
+
+func TestGripperGrabAndOpen(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+	arc.activeBackgroundWorkers.Wait()
+
+	if grab, _, _ := fg.counts(); grab != 1 {
+		t.Fatalf("expected 1 Grab call, got %d", grab)
+	}
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
+		input.ButtonEast: {Event: input.ButtonPress},
+	}, time.Now())
+	arc.activeBackgroundWorkers.Wait()
+
+	if _, open, _ := fg.counts(); open != 1 {
+		t.Fatalf("expected 1 Open call, got %d", open)
+	}
+}
+
+func TestGripperDoesNotBlockTheMovementLoop(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	// Press grab; the fake will not return.
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+
+	// The loop must keep servicing motion while the gripper is stuck.
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 1 {
+		t.Fatalf("expected motion to continue while the gripper blocks, got %v", mv.steps())
+	}
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
+}
+
+func TestConcurrentGripperPressesAreDropped(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{block: make(chan struct{})}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	press := map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}
+	arc.tick(context.Background(), press, time.Now())
+	arc.tick(context.Background(), press, time.Now())
+	arc.tick(context.Background(), press, time.Now())
+
+	close(fg.block)
+	arc.activeBackgroundWorkers.Wait()
+
+	if grab, _, _ := fg.counts(); grab != 1 {
+		t.Fatalf("expected presses during an in-flight op to be dropped, got %d Grab calls", grab)
+	}
+}
+
+func TestEStopStopsTheGripper(t *testing.T) {
+	mv := &fakeMover{}
+	fg := &fakeGripper{}
+	arc := newTestGamepad(t, mv)
+	arc.gripper = fg
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonMenu: {Event: input.ButtonPress},
+	}, time.Now())
+
+	if _, _, stop := fg.counts(); stop != 1 {
+		t.Fatalf("expected the E-stop to stop the gripper, got %d Stop calls", stop)
+	}
+}
+
+func TestGripperControlsAreNoOpsWhenUnconfigured(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv) // arc.gripper stays nil
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:    {Event: input.ButtonPress},
+		input.ButtonSouth: {Event: input.ButtonPress},
+	}, time.Now())
+	// Reaching here without a nil-pointer panic is the assertion.
 }

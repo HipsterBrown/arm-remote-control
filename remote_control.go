@@ -3,6 +3,7 @@ package armremotecontrol
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -496,9 +497,15 @@ type armRemoteControlGamepad struct {
 	logger          logging.Logger
 	cfg             *Config
 
-	// gripper binds the gripper controls, nil when Config.Gripper is unset
-	// (left nil until Task 8 wires it up; nothing calls Open/Grab yet).
+	// gripper binds the gripper controls, nil when Config.Gripper is unset,
+	// in which case handleGripper and stopGripper are no-ops.
 	gripper gripper.Gripper
+
+	// gripperBusy admits one in-flight gripper operation at a time. It is
+	// neither loop-owned nor mu-guarded: tick's CAS and the spawned
+	// goroutine's Store(false) both write it from different goroutines, so
+	// it needs to be its own atomic rather than joining either block.
+	gripperBusy atomic.Bool
 
 	cancelCtx  context.Context
 	cancelFunc func()
@@ -585,6 +592,14 @@ func NewGamepad(ctx context.Context, deps resource.Dependencies, name resource.N
 		return nil, err
 	}
 
+	var gripperDep gripper.Gripper
+	if conf.Gripper != "" {
+		gripperDep, err = gripper.FromProvider(deps, conf.Gripper)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	stepSize := conf.StepSize
@@ -596,6 +611,7 @@ func NewGamepad(ctx context.Context, deps resource.Dependencies, name resource.N
 		Named:               name.AsNamed(),
 		arm:                 arm1,
 		inputController:     controller,
+		gripper:             gripperDep,
 		logger:              logger,
 		cfg:                 conf,
 		cancelCtx:           cancelCtx,
@@ -850,6 +866,11 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		return
 	}
 
+	// Not a gate: dispatched here (below the timer gate, above the
+	// zero-delta return) rather than moved for tidiness. See handleGripper's
+	// doc for why both boundaries are load-bearing.
+	arc.handleGripper(events)
+
 	dx := axisValue(events, input.AbsoluteHat0X) * arc.stepSize
 	dy := axisValue(events, input.AbsoluteHat0Y) * arc.stepSize
 	dz := arc.zAxis(events) * arc.stepSize
@@ -897,7 +918,7 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 //
 // haltMotion is movement-goroutine-only: it writes needsStop, unguarded
 // loop-owned state (see the field comment), with no mutex. It does not
-// touch motionSince -- that stays purely Task 7's run timer, written only
+// touch motionSince -- that stays purely the run timer, written only
 // where it already is (cleared on an idle tick, set on the first step of a
 // run), so haltMotion changing it here would be a second, competing writer.
 // Do not call haltMotion from DoCommand or any other goroutine. The spec
@@ -943,8 +964,8 @@ func (arc *armRemoteControlGamepad) forceHalt(ctx context.Context) {
 	arc.haltMotion(ctx)
 }
 
-// stopGripper halts the gripper if one is configured. Unlike the grab/open
-// path (Task 8) it does not wait on gripperBusy: interrupting an in-flight
+// stopGripper halts the gripper if one is configured. Unlike handleGripper's
+// grab/open path it does not wait on gripperBusy: interrupting an in-flight
 // gripper operation is the entire point of an E-stop.
 func (arc *armRemoteControlGamepad) stopGripper(ctx context.Context) {
 	if arc.gripper == nil {
@@ -953,6 +974,54 @@ func (arc *armRemoteControlGamepad) stopGripper(ctx context.Context) {
 	if err := arc.gripper.Stop(ctx, nil); err != nil {
 		arc.logger.Errorw("failed to stop gripper", "error", err)
 	}
+}
+
+// handleGripper dispatches a gripper press to a background goroutine. Open
+// and Grab block for seconds on real hardware, so running them inline would
+// stall the 10Hz loop -- including its handling of the deadman being
+// released. That is why the call in tick sits below the dead-operator timer
+// gate (a frozen controller still holding ButtonSouth must not re-fire Grab
+// forever) and above the zero-delta early return (a press with no axis
+// input, such as ButtonLT+ButtonSouth alone, must still reach here).
+//
+// Presses arriving while an operation is in flight are dropped, not queued:
+// a queue would keep acting on intent the operator formed seconds ago, which
+// is the opposite of teleoperation.
+func (arc *armRemoteControlGamepad) handleGripper(events map[input.Control]input.Event) {
+	if arc.gripper == nil {
+		return
+	}
+
+	grab := buttonPressed(events, input.ButtonSouth)
+	open := buttonPressed(events, input.ButtonEast)
+	if !grab && !open {
+		return
+	}
+	if !arc.gripperBusy.CompareAndSwap(false, true) {
+		return
+	}
+
+	arc.activeBackgroundWorkers.Add(1)
+	utils.ManagedGo(func() {
+		defer arc.gripperBusy.Store(false)
+
+		if grab {
+			// Grab reports whether it actually closed on something. That
+			// boolean is the operator's only feedback that a grasp failed,
+			// so it is logged either way rather than discarded.
+			grabbed, err := arc.gripper.Grab(arc.cancelCtx, nil)
+			if err != nil {
+				arc.logger.Errorw("gripper grab failed", "error", err)
+				return
+			}
+			arc.logger.Infow("gripper grab complete", "grabbed_something", grabbed)
+			return
+		}
+
+		if err := arc.gripper.Open(arc.cancelCtx, nil); err != nil {
+			arc.logger.Errorw("gripper open failed", "error", err)
+		}
+	}, arc.activeBackgroundWorkers.Done)
 }
 
 // zAxis returns the Z command in the range -1..1, from the analog triggers
