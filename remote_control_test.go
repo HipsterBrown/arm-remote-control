@@ -234,12 +234,18 @@ func TestPureTranslationDoesNotRotate(t *testing.T) {
 		t.Fatalf("step: %v", err)
 	}
 
-	got := fa.getMoveCalls()[0]
-	if got.Point().X != 110 {
+	calls := fa.getMoveCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 MoveToPosition call, got %d", len(calls))
+	}
+	got := calls[0]
+	const eps = 1e-9
+	if math.Abs(got.Point().X-110) > eps {
 		t.Fatalf("expected X to advance to 110, got %v", got.Point().X)
 	}
 	if !spatialmath.OrientationAlmostEqual(got.Orientation(), start.Orientation()) {
-		t.Fatalf("a pure translation must not rotate the tool: orientation changed")
+		t.Fatalf("a pure translation must not rotate the tool: expected orientation %v, got %v",
+			start.Orientation().OrientationVectorDegrees(), got.Orientation().OrientationVectorDegrees())
 	}
 }
 
@@ -253,7 +259,11 @@ func TestRotationIsToolFrameNotBaseFrame(t *testing.T) {
 		spatialmath.NewPose(r3.Vector{}, deltaOrient)); err != nil {
 		t.Fatalf("step: %v", err)
 	}
-	got := fa.getMoveCalls()[0].Orientation()
+	calls := fa.getMoveCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 MoveToPosition call, got %d", len(calls))
+	}
+	got := calls[0].Orientation()
 
 	toolFrame := spatialmath.Compose(
 		spatialmath.NewPoseFromOrientation(startOrient),
@@ -269,7 +279,8 @@ func TestRotationIsToolFrameNotBaseFrame(t *testing.T) {
 		t.Fatalf("test is not discriminating: pick start/delta rotations that do not commute")
 	}
 	if !spatialmath.OrientationAlmostEqual(got, toolFrame) {
-		t.Fatalf("expected tool-frame composition (current then delta), got base-frame")
+		t.Fatalf("expected tool-frame composition %v, got %v",
+			toolFrame.OrientationVectorDegrees(), got.OrientationVectorDegrees())
 	}
 }
 

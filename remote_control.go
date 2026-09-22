@@ -166,11 +166,7 @@ func (m *directMover) step(ctx context.Context, delta spatialmath.Pose) error {
 		return errors.Wrap(err, "failed to get current arm position")
 	}
 
-	d := delta.Point()
-	point := currentPose.Point()
-	point.X += d.X
-	point.Y += d.Y
-	point.Z += d.Z
+	point := currentPose.Point().Add(delta.Point())
 
 	newPose := spatialmath.Compose(
 		spatialmath.NewPose(point, currentPose.Orientation()),
