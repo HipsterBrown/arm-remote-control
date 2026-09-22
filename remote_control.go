@@ -558,9 +558,12 @@ func axisValue(events map[input.Control]input.Event, c input.Control) float64 {
 }
 
 // buttonPressed reports whether a button's most recent event was a press.
+// ButtonHold counts: gamepad_linux.go maps evdev autorepeat (value 2) to
+// ButtonHold, so on a pad that autorepeats, a genuinely held button would
+// otherwise read as released.
 func buttonPressed(events map[input.Control]input.Event, c input.Control) bool {
 	e, ok := events[c]
-	return ok && e.Event == input.ButtonPress
+	return ok && (e.Event == input.ButtonPress || e.Event == input.ButtonHold)
 }
 
 // controllerGone reports whether the controller's latest events say it went

@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"go.viam.com/rdk/components/arm"
+	"go.viam.com/rdk/components/input"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/motion"
@@ -568,5 +569,26 @@ func TestProbeRespectsContextCancellation(t *testing.T) {
 	err := tm.probe(ctx)
 	if err == nil {
 		t.Fatal("expected probe to return an error when its context is cancelled")
+	}
+}
+
+func TestButtonPressedAcceptsHold(t *testing.T) {
+	events := map[input.Control]input.Event{
+		input.ButtonSouth: {Event: input.ButtonPress, Control: input.ButtonSouth},
+		input.ButtonEast:  {Event: input.ButtonHold, Control: input.ButtonEast},
+		input.ButtonWest:  {Event: input.ButtonRelease, Control: input.ButtonWest},
+	}
+
+	if !buttonPressed(events, input.ButtonSouth) {
+		t.Fatalf("expected ButtonPress to count as pressed")
+	}
+	if !buttonPressed(events, input.ButtonEast) {
+		t.Fatalf("expected ButtonHold to count as pressed")
+	}
+	if buttonPressed(events, input.ButtonWest) {
+		t.Fatalf("expected ButtonRelease not to count as pressed")
+	}
+	if buttonPressed(events, input.ButtonNorth) {
+		t.Fatalf("expected an absent control not to count as pressed")
 	}
 }
