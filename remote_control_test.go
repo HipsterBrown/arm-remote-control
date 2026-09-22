@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/golang/geo/r3"
+	"github.com/pkg/errors"
 	commonpb "go.viam.com/api/common/v1"
 	motionpb "go.viam.com/api/service/motion/v1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -646,10 +647,11 @@ func newTestGamepad(t *testing.T, mv mover) *armRemoteControlGamepad {
 func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
 		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
-		input.ButtonRT:      {Event: input.ButtonPress},
+		input.AbsoluteRZ:    {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	steps := mv.steps()
@@ -658,6 +660,105 @@ func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
 	}
 	if steps[0] != [3]float64{10, 0, 10} {
 		t.Fatalf("expected delta (10,0,10), got %v", steps[0])
+	}
+}
+
+func TestZComesFromAnalogTriggers(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	steps := mv.steps()
+	if len(steps) != 1 || steps[0][2] != 10.0 {
+		t.Fatalf("expected dz=10 from a fully pressed right trigger, got %v", steps)
+	}
+}
+
+func TestOpposedTriggersCancel(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteZ:  {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	if len(mv.steps()) != 0 {
+		t.Fatalf("expected both triggers pressed to cancel to no motion, got %v", mv.steps())
+	}
+}
+
+func TestTriggersAreProportional(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = true
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 0.5},
+	}, time.Now())
+
+	if steps := mv.steps(); len(steps) != 1 || steps[0][2] != 5.0 {
+		t.Fatalf("expected dz=5 at half deflection, got %v", steps)
+	}
+}
+
+// fakeController satisfies input.Controller. Only Controls is exercised --
+// tick takes its events as an argument, so nothing else is needed.
+type fakeController struct {
+	input.Controller
+
+	controls []input.Control
+	err      error
+}
+
+func (f *fakeController) Controls(ctx context.Context, extra map[string]interface{}) ([]input.Control, error) {
+	return f.controls, f.err
+}
+
+func TestHasAnalogTriggersDetection(t *testing.T) {
+	logger := newTestLogger(t)
+	ctx := context.Background()
+
+	full := &fakeController{controls: []input.Control{input.AbsoluteX, input.AbsoluteZ, input.AbsoluteRZ}}
+	if !hasAnalogTriggers(ctx, full, logger) {
+		t.Fatalf("expected a pad reporting both trigger axes to use the analog path")
+	}
+
+	// The Nintendo/8BitDo "Pro Controller" S-input shape: triggers are
+	// digital buttons, no trigger axes at all.
+	digital := &fakeController{controls: []input.Control{input.AbsoluteX, input.ButtonLT2, input.ButtonRT2}}
+	if hasAnalogTriggers(ctx, digital, logger) {
+		t.Fatalf("expected a pad without trigger axes to fall back to the digital triggers")
+	}
+
+	partial := &fakeController{controls: []input.Control{input.AbsoluteZ}}
+	if hasAnalogTriggers(ctx, partial, logger) {
+		t.Fatalf("expected a pad reporting only one trigger axis to fall back")
+	}
+
+	// A transient RPC failure is not evidence of an odd pad; assume analog.
+	broken := &fakeController{err: errors.New("boom")}
+	if !hasAnalogTriggers(ctx, broken, logger) {
+		t.Fatalf("expected a Controls error to assume analog triggers")
+	}
+}
+
+func TestZFallsBackToDigitalTriggers(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.analogTriggers = false // pad reports no AbsoluteZ/AbsoluteRZ
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonRT2: {Event: input.ButtonPress},
+	}, time.Now())
+
+	if steps := mv.steps(); len(steps) != 1 || steps[0][2] != 10.0 {
+		t.Fatalf("expected dz=10 from the digital right trigger, got %v", steps)
 	}
 }
 

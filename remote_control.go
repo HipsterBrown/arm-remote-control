@@ -506,6 +506,12 @@ type armRemoteControlGamepad struct {
 	requireEnable       bool
 	maxContinuousMotion time.Duration
 
+	// analogTriggers records whether this pad reports AbsoluteZ/AbsoluteRZ.
+	// Several mappings in gamepad_mappings_linux.go do not, exposing their
+	// triggers only as the digital ButtonLT2/ButtonRT2. Resolved once at
+	// construction rather than probed per tick.
+	analogTriggers bool
+
 	// Button state tracking for continuous movement
 	movementTicker *time.Ticker
 	movementStop   chan struct{}
@@ -555,6 +561,7 @@ func NewGamepad(ctx context.Context, deps resource.Dependencies, name resource.N
 		stepSize:            stepSize,
 		requireEnable:       resolveRequireEnable(conf),
 		maxContinuousMotion: resolveMaxContinuousMotion(conf),
+		analogTriggers:      hasAnalogTriggers(ctx, controller, logger),
 		movementStop:        make(chan struct{}),
 		connected:           true,
 	}
@@ -617,6 +624,32 @@ func axisValue(events map[input.Control]input.Event, c input.Control) float64 {
 func buttonPressed(events map[input.Control]input.Event, c input.Control) bool {
 	e, ok := events[c]
 	return ok && (e.Event == input.ButtonPress || e.Event == input.ButtonHold)
+}
+
+// hasAnalogTriggers reports whether the controller exposes both analog
+// trigger axes. A controller that errors is assumed to have them: the
+// analog path is the common case, and the digital fallback is for known-odd
+// pads, not for transient RPC failures.
+func hasAnalogTriggers(ctx context.Context, c input.Controller, logger logging.Logger) bool {
+	controls, err := c.Controls(ctx, nil)
+	if err != nil {
+		logger.Warnw("could not read controller controls; assuming analog triggers", "error", err)
+		return true
+	}
+
+	var z, rz bool
+	for _, ctrl := range controls {
+		switch ctrl {
+		case input.AbsoluteZ:
+			z = true
+		case input.AbsoluteRZ:
+			rz = true
+		}
+	}
+	if !z || !rz {
+		logger.Info("controller reports no analog triggers; using ButtonLT2/ButtonRT2 for Z")
+	}
+	return z && rz
 }
 
 // controllerGone reports whether the controller's latest events say it went
@@ -695,20 +728,12 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		return
 	}
 
-	rtPressed := buttonPressed(events, input.ButtonRT)
-	ltPressed := buttonPressed(events, input.ButtonLT)
 	hat0X := axisValue(events, input.AbsoluteHat0X)
 	hat0Y := axisValue(events, input.AbsoluteHat0Y)
 
-	var dx, dy, dz float64
+	var dx, dy float64
 
-	// Z-axis movement from buttons
-	if rtPressed {
-		dz += arc.stepSize
-	}
-	if ltPressed {
-		dz -= arc.stepSize
-	}
+	dz := arc.zAxis(events) * arc.stepSize
 
 	// X-axis movement from hat
 	if hat0X != 0.0 {
@@ -732,6 +757,25 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	} else {
 		arc.logger.Debugf("Applied movement step: dx=%f dy=%f dz=%f", dx, dy, dz)
 	}
+}
+
+// zAxis returns the Z command in the range -1..1, from the analog triggers
+// where the pad has them and the digital triggers where it does not.
+// gamepad_linux.go scales AbsoluteZ/AbsoluteRZ to 0..1, so the difference
+// spans -1..1 with both-pressed cancelling to zero.
+func (arc *armRemoteControlGamepad) zAxis(events map[input.Control]input.Event) float64 {
+	if arc.analogTriggers {
+		return axisValue(events, input.AbsoluteRZ) - axisValue(events, input.AbsoluteZ)
+	}
+
+	var z float64
+	if buttonPressed(events, input.ButtonRT2) {
+		z++
+	}
+	if buttonPressed(events, input.ButtonLT2) {
+		z--
+	}
+	return z
 }
 
 func (arc *armRemoteControlGamepad) NewClientFromConn(ctx context.Context, conn rpc.ClientConn, remoteName string, name resource.Name, logger logging.Logger) (resource.Resource, error) {
