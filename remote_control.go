@@ -76,6 +76,12 @@ type Config struct {
 	// the timer, while an omitted field must mean the default, and a plain
 	// int cannot tell those apart.
 	MaxContinuousMotion *int `json:"max_continuous_motion,omitempty"`
+	// PositionOnly sets goal_metric_type=position_only on teleop_start,
+	// leaving orientation unconstrained. Required for arms with fewer than
+	// six DOF, which cannot hold an orientation while translating -- but it
+	// also makes the planner IGNORE goal orientation, so the rotation
+	// controls become inert. Teleop mode only.
+	PositionOnly bool `json:"position_only,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid and important fields exist.
@@ -189,6 +195,9 @@ type teleopMover struct {
 	arm           arm.Arm
 	componentName string // also the reference frame deltas are expressed in
 	logger        logging.Logger
+	// positionOnly sets goal_metric_type=position_only on teleop_start. See
+	// Config.PositionOnly.
+	positionOnly bool
 
 	mu              sync.Mutex
 	consecutiveErrs int
@@ -211,12 +220,14 @@ func newTeleopMover(
 	logger logging.Logger,
 	cancelCtx context.Context,
 	wg *sync.WaitGroup,
+	positionOnly bool,
 ) (*teleopMover, error) {
 	tm := &teleopMover{
 		motionSvc:     motionSvc,
 		arm:           armDep,
 		componentName: componentName,
 		logger:        logger,
+		positionOnly:  positionOnly,
 	}
 
 	if err := tm.start(ctx); err != nil {
@@ -264,30 +275,31 @@ func deltaPoseInFrame(frame string, delta spatialmath.Pose) *commonpb.PoseInFram
 // against go.viam.com/rdk@v1.7.0/services/motion/builtin/teleop.go, not a
 // typo carried over from the spec.
 func (m *teleopMover) start(ctx context.Context) error {
-	// Plan for position only, leaving orientation unconstrained.
-	//
-	// A PoseInFrame always carries an orientation, so an identity-rotation
-	// delta still asks the planner to hold the tool's current orientation
-	// exactly. On an arm with fewer than six degrees of freedom that is
-	// generally unsatisfiable while translating: the RoArm-M3 has no wrist
-	// yaw, so its base joint sets both the tool's azimuth and the working
-	// plane, and any sideways move changes the orientation it was told to
-	// hold. The planner then returns zero IK solutions for X and Y while Z
-	// still succeeds, because motion along the approach axis stays in plane.
-	//
-	// The arm driver already passes this on its own MoveToPosition path,
-	// which is why direct mode works where teleop mode did not.
-	extra, err := structpb.NewStruct(map[string]interface{}{
-		"goal_metric_type": "position_only",
-	})
-	if err != nil {
-		return errors.Wrap(err, "failed to build teleop_start extra")
-	}
 	req := &motionpb.MoveRequest{
 		ComponentName: m.componentName,
 		Destination:   deltaPoseInFrame(m.componentName, spatialmath.NewZeroPose()),
-		Extra:         extra,
 	}
+
+	// position_only is opt-in (Config.PositionOnly): it zeroes the
+	// orientation weight in the planner's goal metric, so setting it
+	// unconditionally would make every rotation command silently do
+	// nothing. It exists at all as an escape hatch for arms with fewer than
+	// six degrees of freedom, which generally cannot hold an orientation
+	// while translating: the RoArm-M3 has no wrist yaw, so its base joint
+	// sets both the tool's azimuth and the working plane, and any sideways
+	// move changes the orientation it was told to hold. The planner then
+	// returns zero IK solutions for X and Y while Z still succeeds, because
+	// motion along the approach axis stays in plane.
+	if m.positionOnly {
+		extra, err := structpb.NewStruct(map[string]interface{}{
+			"goal_metric_type": "position_only",
+		})
+		if err != nil {
+			return errors.Wrap(err, "failed to build teleop_start extra")
+		}
+		req.Extra = extra
+	}
+
 	payload, err := teleopMarshalOpts.Marshal(req)
 	if err != nil {
 		return errors.Wrap(err, "failed to build teleop_start payload")
@@ -502,7 +514,7 @@ func newMover(
 		referenceFrame = conf.ArmName
 	}
 
-	return newTeleopMover(ctx, motionSvc, armDep, referenceFrame, logger, cancelCtx, wg)
+	return newTeleopMover(ctx, motionSvc, armDep, referenceFrame, logger, cancelCtx, wg, conf.PositionOnly)
 }
 
 type armRemoteControlGamepad struct {

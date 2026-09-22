@@ -338,38 +338,51 @@ func TestTeleopModeIssuesStartOnceWithComponentNameAndReferenceFrame(t *testing.
 	}
 }
 
-// A 5-DoF arm cannot hold its tool orientation through a sideways move, so
-// the teleop goal must be position-only or X/Y deltas yield zero IK solutions.
-func TestTeleopStartRequestsPositionOnlyGoal(t *testing.T) {
+// position_only zeroes the orientation weight in the planner's goal metric,
+// so it must be opt-in: on by default would silently discard every rotation
+// command. It stays available as an escape hatch for arms with fewer than
+// six DoF, which cannot hold an orientation through a sideways move.
+func TestTeleopStartOmitsPositionOnlyByDefault(t *testing.T) {
 	fa := &fakeArm{}
 	fms := &fakeMotionService{handler: healthyStatusHandler()}
-	logger := newTestLogger(t)
 	ctx := context.Background()
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	deps := resource.Dependencies{motion.Named("motion-1"): fms}
-	conf := &Config{ArmName: "arm-1", MotionServiceName: "motion-1", ReferenceFrame: "gripper-1"}
-
-	if _, err := newMover(ctx, deps, conf, fa, logger, cancelCtx, &wg); err != nil {
-		t.Fatalf("newMover: %v", err)
+	if _, err := newTeleopMover(ctx, fms, fa, "arm-1", newTestLogger(t), cancelCtx, &wg, false); err != nil {
+		t.Fatalf("newTeleopMover: %v", err)
 	}
-	cancel()
+	cancel() // explicit, not deferred -- see TestTeleopMoveCarriesOrientation
 
-	startCalls := fms.callsFor(motionbuiltin.DoTeleopStart)
-	if len(startCalls) != 1 {
-		t.Fatalf("expected exactly 1 teleop_start call, got %d", len(startCalls))
+	calls := fms.callsFor(motionbuiltin.DoTeleopStart)
+	req := unaryMoveRequest(t, calls[0][motionbuiltin.DoTeleopStart].(string))
+	if req.Extra != nil {
+		if _, ok := req.Extra.AsMap()["goal_metric_type"]; ok {
+			t.Fatalf("expected no goal_metric_type by default: it makes the planner ignore orientation")
+		}
 	}
-	payload, ok := startCalls[0][motionbuiltin.DoTeleopStart].(string)
-	if !ok {
-		t.Fatalf("teleop_start value is not a string: %#v", startCalls[0][motionbuiltin.DoTeleopStart])
-	}
+}
 
-	req := unaryMoveRequest(t, payload)
-	if got := req.GetExtra().AsMap()["goal_metric_type"]; got != "position_only" {
-		t.Fatalf("goal_metric_type = %v, want \"position_only\"", got)
+func TestTeleopStartRequestsPositionOnlyWhenConfigured(t *testing.T) {
+	fa := &fakeArm{}
+	fms := &fakeMotionService{handler: healthyStatusHandler()}
+	ctx := context.Background()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	if _, err := newTeleopMover(ctx, fms, fa, "arm-1", newTestLogger(t), cancelCtx, &wg, true); err != nil {
+		t.Fatalf("newTeleopMover: %v", err)
+	}
+	cancel() // explicit, not deferred -- see TestTeleopMoveCarriesOrientation
+
+	calls := fms.callsFor(motionbuiltin.DoTeleopStart)
+	req := unaryMoveRequest(t, calls[0][motionbuiltin.DoTeleopStart].(string))
+	if req.Extra == nil || req.Extra.AsMap()["goal_metric_type"] != "position_only" {
+		t.Fatalf("expected goal_metric_type=position_only when configured, got %v", req.Extra)
 	}
 }
 
@@ -475,7 +488,7 @@ func TestTeleopMoveCarriesOrientation(t *testing.T) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	tm, err := newTeleopMover(ctx, fms, fa, "gripper-1", logger, cancelCtx, &wg)
+	tm, err := newTeleopMover(ctx, fms, fa, "gripper-1", logger, cancelCtx, &wg, false)
 	if err != nil {
 		t.Fatalf("newTeleopMover: %v", err)
 	}
