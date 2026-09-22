@@ -501,12 +501,13 @@ type armRemoteControlGamepad struct {
 	// State management
 	mu          sync.RWMutex
 	initialized bool
-	stepSize    float64
 
-	// requireEnable and maxContinuousMotion are resolved once from config in
-	// NewGamepad and never written again, so tick reads them lock-free even
-	// though they sit in this mu-guarded block. Do not add a field here that
-	// is written after construction without also giving it mu protection.
+	// stepSize, requireEnable, and maxContinuousMotion are resolved once from
+	// config in NewGamepad and never written again, so tick reads them
+	// lock-free even though they sit in this mu-guarded block. Do not add a
+	// field here that is written after construction without also giving it
+	// mu protection.
+	stepSize            float64
 	requireEnable       bool
 	maxContinuousMotion time.Duration
 
@@ -746,11 +747,11 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 		return
 	}
 
-	// Gates, most authoritative first (see SPEC "Gating order"): controller
-	// gone, then deadman. Insert new gates by authority, not convenience --
-	// Task 6's E-stop outranks the deadman and belongs ABOVE this block;
-	// Task 7's dead-operator timer is subordinate to it and belongs
-	// immediately BELOW.
+	// Gates, most authoritative first (see docs/SPEC-teleop-safety-gripper.md
+	// "Gating order"): controller gone, then deadman. Insert new gates by
+	// authority, not convenience -- Task 6's E-stop outranks the deadman and
+	// belongs ABOVE this block; Task 7's dead-operator timer is subordinate
+	// to it and belongs immediately BELOW.
 	if arc.requireEnable && !buttonPressed(events, input.ButtonLT) {
 		arc.haltMotion(ctx)
 		return
@@ -801,8 +802,8 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 // would look like the obvious move -- this is the designated stop path --
 // but it would race motionSince against the movement loop and could call
 // mover.stop concurrently with a step already in flight. An RPC-triggered
-// stop needs to set a loop-owned flag for tick itself to notice and act on,
-// not call this helper directly.
+// stop needs to set a mu-guarded (or atomic) flag for tick itself to poll
+// and act on, not call this helper directly.
 func (arc *armRemoteControlGamepad) haltMotion(ctx context.Context) {
 	if arc.motionSince.IsZero() {
 		return
