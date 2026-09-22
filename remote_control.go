@@ -23,6 +23,7 @@ import (
 	"go.viam.com/rdk/services/motion"
 	motionbuiltin "go.viam.com/rdk/services/motion/builtin"
 	"go.viam.com/rdk/spatialmath"
+	rdkutils "go.viam.com/rdk/utils"
 	"go.viam.com/utils/rpc"
 )
 
@@ -981,11 +982,35 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	// doc for why both boundaries are load-bearing.
 	arc.handleGripper(events)
 
-	dx := axisValue(events, input.AbsoluteHat0X) * arc.stepSize
-	dy := axisValue(events, input.AbsoluteHat0Y) * arc.stepSize
-	dz := arc.zAxis(events) * arc.stepSize
+	scale := arc.stepSize
+	rot := arc.rotationStepSize
+	if buttonPressed(events, input.ButtonRT) {
+		scale *= fineScale
+		rot *= fineScale
+	}
 
-	if dx == 0 && dy == 0 && dz == 0 {
+	// No deadzone here: gamepad_linux.go already applies the evdev-reported
+	// Flat deadzone before these values reach us, and a second one would
+	// stack with it.
+	//
+	// EulerAngles' three fields compose in a fixed z-y'-x'' order, so at
+	// large deflection this is order-sensitive and can gimbal-lock. Per tick
+	// the default rotation_step_size keeps each axis to a couple of degrees,
+	// small enough that this isn't a concern in practice.
+	delta := spatialmath.NewPose(
+		r3.Vector{
+			X: axisValue(events, input.AbsoluteX) * scale,
+			Y: axisValue(events, input.AbsoluteY) * scale,
+			Z: arc.zAxis(events) * scale,
+		},
+		&spatialmath.EulerAngles{
+			Roll:  rdkutils.DegToRad(axisValue(events, input.AbsoluteHat0X) * rot),
+			Pitch: rdkutils.DegToRad(axisValue(events, input.AbsoluteRY) * rot),
+			Yaw:   rdkutils.DegToRad(axisValue(events, input.AbsoluteRX) * rot),
+		},
+	)
+
+	if spatialmath.PoseAlmostEqual(delta, spatialmath.NewZeroPose()) {
 		// An idle tick ends the run timer, but is not itself a stop --
 		// needsStop is untouched here.
 		arc.motionSince = time.Time{}
@@ -997,15 +1022,13 @@ func (arc *armRemoteControlGamepad) tick(ctx context.Context, events map[input.C
 	}
 	arc.needsStop = true
 
-	delta := spatialmath.NewPose(r3.Vector{X: dx, Y: dy, Z: dz}, spatialmath.NewZeroOrientation())
-
 	stepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	err := arc.mover.step(stepCtx, delta)
 	cancel()
 	if err != nil {
-		arc.logger.Errorw("failed to apply movement step", "error", err, "dx", dx, "dy", dy, "dz", dz)
+		arc.logger.Errorw("failed to apply movement step", "error", err, "delta", delta)
 	} else {
-		arc.logger.Debugf("Applied movement step: dx=%f dy=%f dz=%f", dx, dy, dz)
+		arc.logger.Debugf("Applied movement step: delta=%v", delta)
 	}
 }
 

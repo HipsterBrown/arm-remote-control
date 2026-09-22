@@ -878,14 +878,14 @@ func newTestGamepad(t *testing.T, mv mover) *armRemoteControlGamepad {
 	}
 }
 
-func TestTickAppliesHatAndButtonDeltas(t *testing.T) {
+func TestTickAppliesStickAndButtonDeltas(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
-		input.AbsoluteRZ:    {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:   {Event: input.ButtonPress},
+		input.AbsoluteX:  {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteRZ: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	steps := mv.steps()
@@ -997,12 +997,149 @@ func TestZFallsBackToDigitalTriggers(t *testing.T) {
 	}
 }
 
+func TestLeftStickDrivesTranslation(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.rotationStepSize = 2.0
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteY: {Event: input.PositionChangeAbs, Value: -0.5},
+	}, time.Now())
+
+	steps := mv.steps()
+	if len(steps) != 1 {
+		t.Fatalf("expected 1 step, got %d", len(steps))
+	}
+	got := steps[0].Point()
+	if got.X != 10.0 || got.Y != -5.0 {
+		t.Fatalf("expected proportional translation (10,-5), got (%v,%v)", got.X, got.Y)
+	}
+}
+
+func TestRightStickDrivesRotation(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.rotationStepSize = 10.0
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:   {Event: input.ButtonPress},
+		input.AbsoluteRX: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	steps := mv.steps()
+	if len(steps) != 1 {
+		t.Fatalf("expected 1 step, got %d", len(steps))
+	}
+	if pt := steps[0].Point(); pt.X != 0 || pt.Y != 0 || pt.Z != 0 {
+		t.Fatalf("stick rotation must not translate, got %v", pt)
+	}
+	if ov := steps[0].Orientation().OrientationVectorDegrees(); ov.Theta == 0 {
+		t.Fatalf("expected a non-zero rotation from full right-stick deflection")
+	}
+}
+
+func TestDegreesReachRadians(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.rotationStepSize = 90.0
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	// 90 degrees, not 90 radians. A missing DegToRad gives ~5157 degrees,
+	// which wraps to something nowhere near a quarter turn.
+	want := &spatialmath.EulerAngles{Roll: rdkutils.DegToRad(90)}
+	if !spatialmath.OrientationAlmostEqual(mv.steps()[0].Orientation(), want) {
+		t.Fatalf("expected a 90-degree roll; the degrees-to-radians conversion is missing or wrong")
+	}
+}
+
+func TestFineSpeedScalesBothTranslationAndRotation(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+	arc.rotationStepSize = 40.0
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT:      {Event: input.ButtonPress},
+		input.ButtonRT:      {Event: input.ButtonPress}, // fine speed
+		input.AbsoluteX:     {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+	}, time.Now())
+
+	step := mv.steps()[0]
+	if got := step.Point().X; got != 2.5 {
+		t.Fatalf("expected fine speed to quarter translation to 2.5, got %v", got)
+	}
+	want := &spatialmath.EulerAngles{Roll: rdkutils.DegToRad(10)} // 40 * 0.25
+	if !spatialmath.OrientationAlmostEqual(step.Orientation(), want) {
+		t.Fatalf("expected fine speed to quarter rotation to 10 degrees")
+	}
+}
+
+func TestCombinedTranslationAndRotationDelta(t *testing.T) {
+	// The case an operator produces constantly -- stick deflected AND wrist
+	// twisting -- and the one no Task 2 test covered, because until this task
+	// rotation was never wired to a control, so a combined delta was
+	// unreachable from tick. It is reachable now.
+	//
+	// The property: the translation component must land in the ARM frame --
+	// exactly where translation alone would put it -- and must NOT be rotated
+	// by the delta's own rotation. A naive monolithic Compose(current, delta)
+	// is off by up to ~153mm on cases in this shape.
+	start := spatialmath.NewPose(
+		r3.Vector{X: 100, Y: 200, Z: 300},
+		&spatialmath.EulerAngles{Pitch: rdkutils.DegToRad(30)},
+	)
+	fa := &fakeArm{endPos: start}
+	m := &directMover{arm: fa}
+
+	delta := spatialmath.NewPose(
+		r3.Vector{X: 10, Y: -5, Z: 0},
+		&spatialmath.EulerAngles{Yaw: rdkutils.DegToRad(15)},
+	)
+	if err := m.step(context.Background(), delta); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	got := fa.getMoveCalls()[0]
+	const eps = 1e-9
+	if math.Abs(got.Point().X-110) > eps || math.Abs(got.Point().Y-195) > eps ||
+		math.Abs(got.Point().Z-300) > eps {
+		t.Fatalf("translation must stay in the arm frame: expected (110,195,300), got %v", got.Point())
+	}
+
+	want := spatialmath.Compose(
+		spatialmath.NewPoseFromOrientation(start.Orientation()),
+		spatialmath.NewPoseFromOrientation(delta.Orientation()),
+	).Orientation()
+	if !spatialmath.OrientationAlmostEqual(got.Orientation(), want) {
+		t.Fatalf("expected tool-frame rotation alongside arm-frame translation")
+	}
+}
+
+func TestZeroDeltaSkipsTheTick(t *testing.T) {
+	mv := &fakeMover{}
+	arc := newTestGamepad(t, mv)
+
+	arc.tick(context.Background(), map[input.Control]input.Event{
+		input.ButtonLT: {Event: input.ButtonPress},
+	}, time.Now())
+
+	if len(mv.steps()) != 0 {
+		t.Fatalf("expected a zero delta to issue no step, got %v", mv.steps())
+	}
+}
+
 func TestDeadmanBlocksMotionWhenNotHeld(t *testing.T) {
 	mv := &fakeMover{}
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	if len(mv.steps()) != 0 {
@@ -1021,8 +1158,8 @@ func TestDeadmanAllowsMotionWhenHeld(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	if len(mv.steps()) != 1 {
@@ -1035,12 +1172,12 @@ func TestDeadmanReleaseStopsExactlyOnce(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	held := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 	released := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonRelease},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonRelease},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 
 	arc.tick(context.Background(), held, time.Now())
@@ -1071,8 +1208,8 @@ func TestDeadmanReleaseStopsAfterAnIdleTick(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	moving := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 	idle := map[input.Control]input.Event{
 		input.ButtonLT: {Event: input.ButtonHold},
@@ -1096,7 +1233,7 @@ func TestDeadmanCanBeDisabled(t *testing.T) {
 	arc.requireEnable = false
 
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	if len(mv.steps()) != 1 {
@@ -1236,8 +1373,8 @@ func TestEStopLatchesAndBlocksMotion(t *testing.T) {
 	arc := newTestGamepad(t, mv)
 
 	moving := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 
 	arc.tick(context.Background(), moving, time.Now())
@@ -1276,8 +1413,8 @@ func TestEStopClearsOnStart(t *testing.T) {
 	}, time.Now())
 
 	moving := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}
 	arc.tick(context.Background(), moving, time.Now())
 
@@ -1306,8 +1443,8 @@ func TestDeadOperatorTimerStopsFrozenController(t *testing.T) {
 
 	start := time.Now()
 	frozen := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonLT:  {Event: input.ButtonPress, Time: start},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
 	}
 
 	arc.tick(context.Background(), frozen, start)
@@ -1336,8 +1473,8 @@ func TestDeadOperatorTimerStopsFrozenController(t *testing.T) {
 	// its own trip condition -- so pin that a tick with genuinely fresh
 	// event timestamps lets motion through again.
 	recovered := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start.Add(10 * time.Second)},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(10 * time.Second)},
+		input.ButtonLT:  {Event: input.ButtonPress, Time: start.Add(10 * time.Second)},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(10 * time.Second)},
 	}
 	arc.tick(context.Background(), recovered, start.Add(10*time.Second))
 
@@ -1355,8 +1492,8 @@ func TestDeadOperatorTimerResetsOnFreshEvents(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		at := start.Add(time.Duration(i) * 500 * time.Millisecond)
 		arc.tick(context.Background(), map[input.Control]input.Event{
-			input.ButtonLT:      {Event: input.ButtonPress, Time: at},
-			input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: at},
+			input.ButtonLT:  {Event: input.ButtonPress, Time: at},
+			input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: at},
 		}, at)
 	}
 
@@ -1382,8 +1519,8 @@ func TestIdleTicksClearTheRunTimer(t *testing.T) {
 	at := func(d time.Duration) time.Time { return start.Add(d) }
 	moving := func(d time.Duration) map[input.Control]input.Event {
 		return map[input.Control]input.Event{
-			input.ButtonLT:      {Event: input.ButtonPress, Time: at(d)},
-			input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: at(d)},
+			input.ButtonLT:  {Event: input.ButtonPress, Time: at(d)},
+			input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: at(d)},
 		}
 	}
 	resting := func(d time.Duration) map[input.Control]input.Event {
@@ -1412,8 +1549,8 @@ func TestDeadOperatorTimerCanBeDisabled(t *testing.T) {
 
 	start := time.Now()
 	frozen := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonLT:  {Event: input.ButtonPress, Time: start},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
 	}
 
 	arc.tick(context.Background(), frozen, start)
@@ -1440,8 +1577,8 @@ func TestDeadOperatorTimerUsesHostClockNotControllerClock(t *testing.T) {
 	// The controller's own clock reports timestamps an hour ahead of the
 	// host's -- e.g. a modular/remote controller with clock drift.
 	aheadOfHost := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start.Add(time.Hour)},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(time.Hour)},
+		input.ButtonLT:  {Event: input.ButtonPress, Time: start.Add(time.Hour)},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0, Time: start.Add(time.Hour)},
 	}
 
 	arc.tick(context.Background(), aheadOfHost, start)
@@ -1549,8 +1686,8 @@ func TestGripperDoesNotBlockTheMovementLoop(t *testing.T) {
 
 	// The loop must keep servicing motion while the gripper is stuck.
 	arc.tick(context.Background(), map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0},
+		input.ButtonLT:  {Event: input.ButtonPress},
+		input.AbsoluteX: {Event: input.PositionChangeAbs, Value: 1.0},
 	}, time.Now())
 
 	if len(mv.steps()) != 1 {
@@ -1762,9 +1899,9 @@ func TestGripperDispatchGatedByDeadOperatorTimer(t *testing.T) {
 
 	start := time.Now()
 	frozen := map[input.Control]input.Event{
-		input.ButtonLT:      {Event: input.ButtonPress, Time: start},
-		input.AbsoluteHat0X: {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
-		input.ButtonSouth:   {Event: input.ButtonPress, Time: start},
+		input.ButtonLT:    {Event: input.ButtonPress, Time: start},
+		input.AbsoluteX:   {Event: input.PositionChangeAbs, Value: 1.0, Time: start},
+		input.ButtonSouth: {Event: input.ButtonPress, Time: start},
 	}
 
 	for i := 0; i < 11; i++ {
