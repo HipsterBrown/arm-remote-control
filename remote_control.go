@@ -135,8 +135,8 @@ func resolveMaxContinuousMotion(conf *Config) time.Duration {
 type mover interface {
 	// step applies a relative delta: translation in millimetres, rotation as
 	// a small orientation. Translation is applied in the arm/reference
-	// frame; rotation is composed onto the tool. Never accumulated across
-	// calls.
+	// frame; rotation is composed onto the tool (for teleopMover, onto the
+	// configured reference frame). Never accumulated across calls.
 	step(ctx context.Context, delta spatialmath.Pose) error
 	// stop halts motion. Always also calls arm.Stop where relevant.
 	stop(ctx context.Context) error
@@ -239,17 +239,20 @@ func newTeleopMover(
 var teleopMarshalOpts = protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}
 
 // deltaPoseInFrame builds the PoseInFrame proto used as both teleop_start's
-// destination and teleop_move's payload. The orientation is always the
-// identity orientation vector (o_z=1, theta=0): this mover only ever
-// expresses translation, never rotation.
-func deltaPoseInFrame(frame string, dx, dy, dz float64) *commonpb.PoseInFrame {
+// destination and teleop_move's payload, from a relative pose delta.
+func deltaPoseInFrame(frame string, delta spatialmath.Pose) *commonpb.PoseInFrame {
+	pt := delta.Point()
+	ov := delta.Orientation().OrientationVectorDegrees()
 	return &commonpb.PoseInFrame{
 		ReferenceFrame: frame,
 		Pose: &commonpb.Pose{
-			X:  dx,
-			Y:  dy,
-			Z:  dz,
-			OZ: 1,
+			X:     pt.X,
+			Y:     pt.Y,
+			Z:     pt.Z,
+			OX:    ov.OX,
+			OY:    ov.OY,
+			OZ:    ov.OZ,
+			Theta: ov.Theta,
 		},
 	}
 }
@@ -282,7 +285,7 @@ func (m *teleopMover) start(ctx context.Context) error {
 	}
 	req := &motionpb.MoveRequest{
 		ComponentName: m.componentName,
-		Destination:   deltaPoseInFrame(m.componentName, 0, 0, 0),
+		Destination:   deltaPoseInFrame(m.componentName, spatialmath.NewZeroPose()),
 		Extra:         extra,
 	}
 	payload, err := teleopMarshalOpts.Marshal(req)
@@ -300,8 +303,7 @@ func (m *teleopMover) start(ctx context.Context) error {
 // accumulates a target locally: each call carries only this tick's delta, and
 // the pipeline resolves it against its own live planning head.
 func (m *teleopMover) step(ctx context.Context, delta spatialmath.Pose) error {
-	d := delta.Point()
-	poseBytes, err := teleopMarshalOpts.Marshal(deltaPoseInFrame(m.componentName, d.X, d.Y, d.Z))
+	poseBytes, err := teleopMarshalOpts.Marshal(deltaPoseInFrame(m.componentName, delta))
 	if err != nil {
 		return errors.Wrap(err, "failed to build teleop_move payload")
 	}

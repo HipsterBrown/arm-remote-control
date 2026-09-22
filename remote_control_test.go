@@ -458,6 +458,54 @@ func TestStepDeltasAreRelativeNotAccumulating(t *testing.T) {
 	}
 }
 
+func TestTeleopMoveCarriesOrientation(t *testing.T) {
+	fa := &fakeArm{}
+	fms := &fakeMotionService{handler: healthyStatusHandler()}
+	logger := newTestLogger(t)
+	ctx := context.Background()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	tm, err := newTeleopMover(ctx, fms, fa, "gripper-1", logger, cancelCtx, &wg)
+	if err != nil {
+		t.Fatalf("newTeleopMover: %v", err)
+	}
+	// Explicit, not deferred. Defers are LIFO, so the deferred wg.Wait()
+	// above would run BEFORE a deferred cancel() and block forever on the
+	// pollStatus goroutine, which only exits on cancelCtx.Done(). Every
+	// existing teleop test in this file cancels here for the same reason.
+	cancel()
+
+	delta := spatialmath.NewPose(
+		r3.Vector{X: 5},
+		&spatialmath.EulerAngles{Roll: rdkutils.DegToRad(10)},
+	)
+	if err := tm.step(ctx, delta); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+
+	calls := fms.callsFor(motionbuiltin.DoTeleopMove)
+	last := calls[len(calls)-1]
+	pif := unaryPoseInFrame(t, last[motionbuiltin.DoTeleopMove].(string))
+
+	want := delta.Orientation().OrientationVectorDegrees()
+	got := pif.Pose
+	if got.Theta == 0 {
+		t.Fatalf("expected a non-zero theta for a 10-degree roll, got the identity orientation")
+	}
+	const eps = 1e-6
+	if math.Abs(got.OX-want.OX) > eps || math.Abs(got.OY-want.OY) > eps ||
+		math.Abs(got.OZ-want.OZ) > eps || math.Abs(got.Theta-want.Theta) > eps {
+		t.Fatalf("expected ov (%v,%v,%v,%v), got (%v,%v,%v,%v)",
+			want.OX, want.OY, want.OZ, want.Theta, got.OX, got.OY, got.OZ, got.Theta)
+	}
+	if got.X != 5 {
+		t.Fatalf("expected the translation to survive alongside the rotation, got X=%v", got.X)
+	}
+}
+
 func TestReferenceFrameDefaultsToArmName(t *testing.T) {
 	fa := &fakeArm{}
 	fms := &fakeMotionService{handler: healthyStatusHandler()}
